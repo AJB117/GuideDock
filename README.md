@@ -28,6 +28,14 @@ By default, IDs come from the bundled `train.txt`, `val.txt`, and `test.txt` fil
 
 Each output record is `(id, receptor_sequence, receptor_atom14, binder_sequence, binder_atom14)`. Coordinates are float32 arrays with shape `(residues, 14, 3)` and use the shared residue templates.
 
+## Sampling
+
+All sampling runs use `sample.py`. The default samples several distance maps, averages them, and shares that guide across the `--top_k` docking candidates.
+
+Use `--resample_distance_per_pose` for the former `sample_k.py` behavior: draw a separate distance map for each candidate and save all candidate results. `--save_all_samples` also enables those outputs in the default mode. `--distance_steps` and `--distance_guidance_scale` override latent sampling settings.
+
+Per-complex outputs are `<ID>_k_results_step<step>.pt`; the combined results are `all_results_step<step>.pt`. The Lightning evaluator continues to return aggregate metrics for the best pose by complex RMSD. Programmatic callers can request the full candidate list with `evaluate_samples(..., return_all=True)`.
+
 ## Checks
 
 ```bash

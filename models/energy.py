@@ -920,13 +920,13 @@ class AllAtomEnergyModel(FARigidModel):
                     device=self.device
                 )
 
-                delta_t = tr_g**2 * dt * tr_score
-                delta_t = delta_t + (tr_g * math.sqrt(dt) * epsilon_t)
-                delta_t = delta_t.detach().requires_grad_(True)
+            delta_t = tr_g**2 * dt * tr_score
+            delta_t = delta_t + (tr_g * math.sqrt(dt) * epsilon_t)
+            delta_t = delta_t.detach().requires_grad_(True)
 
-                delta_w = rot_g**2 * dt * rot_score
-                delta_w = delta_w + (rot_g * math.sqrt(dt) * epsilon_w)
-                delta_w = delta_w.detach().requires_grad_(True)
+            delta_w = rot_g**2 * dt * rot_score
+            delta_w = delta_w + (rot_g * math.sqrt(dt) * epsilon_w)
+            delta_w = delta_w.detach().requires_grad_(True)
 
             bind_X_centered = bind_X_centered.requires_grad_()
 
@@ -938,7 +938,7 @@ class AllAtomEnergyModel(FARigidModel):
             bind_X = bind_X_rotated + center
 
             bind_X = bind_X * atom_mask
-            energy = 0
+            energy = torch.zeros(B, device=device, dtype=bind_X.dtype)
 
             if t_idx % 2 == 0:
                 if D_guide is not None:

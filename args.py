@@ -253,6 +253,24 @@ def parse_args():
         help="If set, save full docking trajectory",
     )
     parser.add_argument(
+        "--resample_distance_per_pose",
+        action="store_true",
+        help="Draw an independent distance map for each docking candidate",
+    )
+    parser.add_argument(
+        "--save_all_samples",
+        action="store_true",
+        help="Save every docking candidate and its metrics",
+    )
+    parser.add_argument(
+        "--distance_steps", type=int, help="Override latent distance sampling steps"
+    )
+    parser.add_argument(
+        "--distance_guidance_scale",
+        type=float,
+        help="Override latent distance guidance scale",
+    )
+    parser.add_argument(
         "--num_D_samples",
         type=int,
         default=4,

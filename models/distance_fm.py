@@ -311,11 +311,14 @@ class LatentFlowMatching(nn.Module):
         """
         Euler Integration using Algorithm 3 from the PDF.
         """
+        if num_samples < 1 or steps < 1:
+            raise ValueError("num_samples and steps must be positive")
         device = self.device
         M, N = bind_H.size(1), target_H.size(1)
 
         zt = torch.randn(num_samples, M + N, self.latent_dim, device=device)
-        zt = zt - zt.mean(dim=0, keepdim=True)
+        if num_samples > 1:
+            zt = zt - zt.mean(dim=0, keepdim=True)
         zt = (zt - self.latent_mean) / self.latent_std
 
         dt = 1.0 / steps
