@@ -1,3 +1,5 @@
+# Credit for base code to: https://github.com/wengong-jin/DSMBind
+
 import torch
 
 from utils import ALPHABET, get_resolution_indices

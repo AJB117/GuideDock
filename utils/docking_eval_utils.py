@@ -1,3 +1,5 @@
+# Credit for base code to: https://github.com/ketatam/DiffDock-PP
+
 import math
 
 import numpy as np

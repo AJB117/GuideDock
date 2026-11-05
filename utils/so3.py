@@ -1,3 +1,5 @@
+# Credit for base code to: https://github.com/ketatam/DiffDock-PP
+
 """
 Taken directly from DiffDock without modification
 except for code formatting via Black

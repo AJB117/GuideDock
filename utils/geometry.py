@@ -40,6 +40,7 @@ def cross_product(a, b):
         return torch.cross(a, b, dim=-1)
 
 
+# Credit for base code to: https://github.com/wengong-jin/DSMBind
 def rotate(X, w, sel: int):
     with torch.enable_grad():
         B, N = X.size(0), X.size(1)

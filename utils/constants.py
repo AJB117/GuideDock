@@ -1,3 +1,5 @@
+# Credit for base code to: https://github.com/wengong-jin/DSMBind
+
 RESTYPE_1to3 = {
     "A": "ALA",
     "R": "ARG",

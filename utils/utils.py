@@ -91,6 +91,7 @@ class NoiseSchedule:
         return tr_s, rot_s
 
 
+# Credit for base code to: https://github.com/wengong-jin/DSMBind
 def compute_dihedrals(X, eps=1e-7):
 
     X = X.unsqueeze(0)
