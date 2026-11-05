@@ -1,5 +1,5 @@
 from args import parse_args
-from main_lightning import main
+from main import main
 
 if __name__ == "__main__":
     args = parse_args()

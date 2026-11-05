@@ -8,8 +8,8 @@ Use the existing PyTorch and Lightning environment with the dataset, embedding, 
 | --- | --- |
 | `train_contact_vae.py` | Train the continuous-distance VAE |
 | `train_contact_diff.py` | Train latent flow matching |
-| `main_lightning.py` | Train or evaluate the docking model |
-| `main_sample_lightning.py` | Run the same docking implementation in test mode |
+| `main.py` | Train or evaluate the docking model |
+| `main_sample.py` | Run the same docking implementation in test mode |
 | `capri_eval.py` | Summarize CAPRI metrics |
 
 Each entry point supports `--help`. Neural building blocks live in `models/common.py`, general helpers in `utils/utils.py`, and shared data loading in `datasets/datamodule.py`.
