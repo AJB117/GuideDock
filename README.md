@@ -17,7 +17,7 @@ Each script supports `--help`. Use `--resample_distance_per_pose` for independen
 Download DIPS-Het structures and build the dataset:
 
 ```bash
-bash data/DIPS-Het/download.sh
+python data/DIPS-Het/download.py
 python data/DIPS-Het/build_dipshet.py --structures data/DIPS-Het/structures --workers 8
 ```
 
