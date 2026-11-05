@@ -14,10 +14,11 @@ GuideDock predicts the relative pose of a binder and receptor from their individ
 
 Each script supports `--help`. Use `--resample_distance_per_pose` for independent distance guides and `--save_all_samples` to save every candidate.
 
-Build DIPS-Het from PDB or mmCIF structures, including gzip files:
+Download DIPS-Het structures and build the dataset:
 
 ```bash
-python data/DIPS-Het/build_dipshet.py --structures /path/to/structures --workers 8
+bash data/DIPS-Het/download.sh
+python data/DIPS-Het/build_dipshet.py --structures data/DIPS-Het/structures --workers 8
 ```
 
 The builder uses the bundled splits and writes `data/DIPS-Het/data.pkl`.
