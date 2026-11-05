@@ -4,7 +4,6 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
-
 from utils import ALPHABET, Features
 
 from .common import FiLM, SinusoidalDistanceEmbedding
@@ -13,7 +12,6 @@ from .encoders import (
     CrossAttentionEncoder,
     DiTEncoder,
     EquiformerEncoder,
-    FAFormerEncoder,
     FlashIPAEncoder,
     IPAEncoder,
     PairResidueEncoder,
@@ -170,16 +168,6 @@ class AllAtomEncoder(FrameAveraging):
                 self.encoder_pre = IPAEncoder(args, require_pairwise_repr=True)
 
             self.encoder = IPAEncoder(args)
-        elif args.encoder == "faformer":
-            self.encoder_1 = FAFormerEncoder(
-                args, d_input=hidden_size + 2 * args.fourier_dim
-            )
-            self.encoder_2 = FAFormerEncoder(
-                args, d_input=hidden_size + 2 * args.fourier_dim
-            )
-            self.encoder_3 = FAFormerEncoder(
-                args, d_input=hidden_size // 2 + 2 * args.fourier_dim
-            )
         elif args.encoder == "equiformer":
             self.encoder = EquiformerEncoder(args)
         elif args.encoder == "flash_ipa":
@@ -197,7 +185,7 @@ class AllAtomEncoder(FrameAveraging):
         elif args.encoder == "dit":
             self.encoder = DiTEncoder(args)
 
-        if args.encoder in ("ipa", "faformer", "flash_ipa", "sa", "cross", "dit"):
+        if args.encoder in ("ipa", "flash_ipa", "sa", "cross", "dit"):
             if args.require_pairwise_repr:
                 self.pair_encoder = PairResidueEncoder(args)
             self.proj = nn.Linear(hidden_size * 2, hidden_size)
@@ -244,7 +232,6 @@ class AllAtomEncoder(FrameAveraging):
             hidden_size // 2
             if args.encoder
             not in (
-                "faformer",
                 "gt",
                 "mpnn",
                 "equiformer",
@@ -444,21 +431,9 @@ class AllAtomEncoder(FrameAveraging):
             all_X = torch.cat([bind_X, tgt_X], dim=1)
             all_mask = torch.cat([binder_mask, tgt_mask], dim=1)
 
-            H = self.encoder(all_H, all_X, ~all_mask)
+            self.encoder(all_H, all_X, ~all_mask)
         else:
-            bind_H = self.encoder_1(bind_H, bind_X, ~binder_mask, 30)
-            tgt_H = self.encoder_2(tgt_H, tgt_X, ~tgt_mask, 30)
-
-            all_H = torch.cat([bind_H, tgt_H], dim=1)
-            all_X = torch.cat([bind_X, tgt_X], dim=1)
-            all_mask = torch.cat([binder_mask, tgt_mask], dim=1)
-            H = self.encoder_3(all_H, all_X, ~all_mask, 40 * eps_tr + 30)
-
-            bind_H = torch.cat((bind_H, H[:, : M * sel, :]), dim=-1)
-            tgt_H = torch.cat((tgt_H, H[:, M * sel :, :]), dim=-1)
-
-            bind_H = self.proj_1(bind_H)
-            tgt_H = self.proj_2(tgt_H)
+            raise ValueError(f"Unsupported encoder: {self.encoder_type}")
 
         h1, h2 = bind_H, tgt_H
 

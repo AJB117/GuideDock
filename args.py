@@ -77,7 +77,6 @@ def parse_args():
             "sa",
             "lstm",
             "ipa",
-            "faformer",
             "equiformer",
             "flash_ipa",
             "cross",

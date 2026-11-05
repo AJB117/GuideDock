@@ -4,16 +4,14 @@ import torch.nn.functional as F
 from einops import repeat
 from equiformer_pytorch import Equiformer
 from torch import Tensor
-
 from utils import construct_3d_basis
 
 from .common import GLU, GaussianSmearing
-from .faformer import FAFormer
 from .flash_ipa.edge_embedder import EdgeEmbedderConfig
 from .flash_ipa.ipa import IPAConfig
 from .flash_ipa.model import Model, ModelConfig, create_rigid
 from .ipa import IPABlock
-from .modules import AdaLN, DiTBlock, FourierFeats
+from .modules import AdaLN, DiTBlock
 
 
 class FlashIPAEncoder(nn.Module):
@@ -253,31 +251,6 @@ class EquiformerEncoder(nn.Module):
         h = self.down_proj(h)
         embs = self.model(h, x, mask).type0
         embs = self.up_proj(embs)
-        return embs
-
-
-class FAFormerEncoder(nn.Module):
-    def __init__(self, args, d_input):
-        super(FAFormerEncoder, self).__init__()
-        self.faformer = FAFormer(
-            d_input=d_input,
-            d_model=args.hidden_size // 2,
-            n_layers=args.depth,
-            n_neighbors=30,
-            n_heads=args.heads,
-            d_edge_model=args.hidden_size // 2,
-            activation="silu",
-            valid_radius=args.threshold,
-            embedding_grad_frac=0.5,
-            attn_drop=args.dropout,
-            proj_drop=args.dropout,
-        )
-        self.fourier_feats = FourierFeats(args)
-
-    def forward(self, h, x, mask, radius=15.0, pair_h=None):
-
-        embs, coords = self.faformer(h, x, radius, mask)
-
         return embs
 
 
