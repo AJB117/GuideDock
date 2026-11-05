@@ -23,6 +23,12 @@ python data/DIPS-Het/build_dipshet.py --structures data/DIPS-Het/structures --wo
 
 The builder uses the bundled splits and writes `data/DIPS-Het/data.pkl`.
 
+Download DB5.5 bound and unbound structures:
+
+```bash
+bash data/db55/download.sh
+```
+
 ## Citation
 
 Our work is in submission.

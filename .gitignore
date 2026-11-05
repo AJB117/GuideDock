@@ -220,3 +220,4 @@ __marimo__/
 .streamlit/secrets.toml
 
 /data/DIPS-Het/structures/
+/data/db55/benchmark5.5/
