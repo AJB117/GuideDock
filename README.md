@@ -32,6 +32,5 @@ Our work is in submission.
   author = {Soga, Patrick and Lei, Zhenyu and He, Yinhan and Bilodeau, Camille and Li, Jundong},
   year = {2026},
   note = {In submission},
-  eprint = {}
 }
 ```
