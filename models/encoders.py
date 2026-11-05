@@ -1,50 +1,43 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-import pdb
-from utils import *
 from einops import repeat
 from equiformer_pytorch import Equiformer
 from torch import Tensor
 
+from utils import construct_3d_basis
+
+from .common import GLU, GaussianSmearing
 from .faformer import FAFormer
-from .ipa import IPABlock
-from .flash_ipa.ipa import IPAConfig
 from .flash_ipa.edge_embedder import EdgeEmbedderConfig
+from .flash_ipa.ipa import IPAConfig
 from .flash_ipa.model import Model, ModelConfig, create_rigid
-from .modules import FourierFeats, GaussianSmearing, FiLM, GLU, AdaLN, DiTBlock
+from .ipa import IPABlock
+from .modules import AdaLN, DiTBlock, FourierFeats
+
 
 class FlashIPAEncoder(nn.Module):
     def __init__(self, hidden_size, heads, depth, dropout):
         super(FlashIPAEncoder, self).__init__()
-        max_len = 8192  # max length of the input sequence
+        max_len = 8192
         node_embed_size = hidden_size
         edge_embed_size = hidden_size // 2
 
-        # IPA config options
-        use_flash_attn = True  # True for flash ipa, False for original ipa
-        attn_dtype = "fp16"  # "fp16", "bf16", "fp32". For flash ipa, bf16 or fp16. For original, fp32.
-        c_s = node_embed_size  # size of the node embedding
-        c_z = edge_embed_size  # size of the edge embedding
-        c_hidden = hidden_size  # size of the hidden layer in the ipa
-        no_heads = heads  # number of attention heads in the ipa
-        z_factor_rank = (
-            2  # rank of the z factor rank for the edge embedding factorization
-        )
-        no_qk_points = 8  # number of query/key points
-        no_v_points = 12  # number of value points
-        seq_tfmr_num_heads = (
-            heads  # number of heads in the node embedding update transformer
-        )
-        seq_tfmr_num_layers = (
-            1  # number of layers in the node embedding update transformer
-        )
-        num_blocks = depth  # number of blocks in the model
+        use_flash_attn = True
+        attn_dtype = "fp16"
+        c_s = node_embed_size
+        c_z = edge_embed_size
+        c_hidden = hidden_size
+        no_heads = heads
+        z_factor_rank = 2
+        no_qk_points = 8
+        no_v_points = 12
+        seq_tfmr_num_heads = heads
+        seq_tfmr_num_layers = 1
+        num_blocks = depth
 
-        # Edge embedder config
-        mode = "flash_1d_bias"  # "orig_no_bias", "orig_2d_bias", "flash_no_bias", "flash_1d_bias", "flash_2d_factorize_bias"
-        k_nearest_neighbors = 20  # Number of nearest neighbors for the distogram
+        mode = "flash_1d_bias"
+        k_nearest_neighbors = 20
 
         ipa_conf = IPAConfig(
             use_flash_attn=use_flash_attn,
@@ -53,7 +46,7 @@ class FlashIPAEncoder(nn.Module):
             c_z=c_z,
             c_hidden=c_hidden,
             no_heads=no_heads,
-            z_factor_rank=z_factor_rank,  # Rank of the factorization of the edge embedding
+            z_factor_rank=z_factor_rank,
             no_qk_points=no_qk_points,
             no_v_points=no_v_points,
             seq_tfmr_num_heads=seq_tfmr_num_heads,
@@ -61,12 +54,12 @@ class FlashIPAEncoder(nn.Module):
             num_blocks=num_blocks,
         )
         edge_features_conf = EdgeEmbedderConfig(
-            z_factor_rank=z_factor_rank,  # Rank of the factorization of the edge embedding
-            c_s=c_s,  # Size of the node embedding
-            c_p=c_z,  # Size of the edge embedding
-            mode=mode,  # "orig_no_bias", "orig_2d_bias", "flash_no_bias", "flash_1d_bias", "flash_2d_factorize_bias"
-            k=k_nearest_neighbors,  # Number of nearest neighbors for the distogram
-            max_len=max_len,  # Maximum length of the input sequence
+            z_factor_rank=z_factor_rank,
+            c_s=c_s,
+            c_p=c_z,
+            mode=mode,
+            k=k_nearest_neighbors,
+            max_len=max_len,
             num_bins=22,
             feat_dim=c_z,
         )
@@ -78,8 +71,6 @@ class FlashIPAEncoder(nn.Module):
             edge_features=edge_features_conf,
         )
         self.encoder = Model(model_conf, dropout)
-        # self.edge_embedding = GaussianSmearing(0.0, args.threshold, args.hidden_size // 2)
-        # self.proj = nn.Linear(args.noise_emb_dim, args.hidden_size)
 
     def apply_rot_and_tr(self, X: Tensor, R: Tensor, t: Tensor):
         """
@@ -101,27 +92,14 @@ class FlashIPAEncoder(nn.Module):
     ):
         R = construct_3d_basis(x[:, :, 1], x[:, :, 2], x[:, :, 0])
         t = x[:, :, 1]
-        # t = x.view(h.shape[0], -1, 3)
-
-        # if sel > 1:
-        #     R = R.repeat_interleave(sel, dim=1)
-        #     t = t.repeat_interleave(sel, dim=1)
-
-        # dists = self.edge_embedding((
-        #     x.view(1, -1, 3)[:, :, None, :] - x.view(1, -1, 3)[:, None, :, :]
-        # ).norm(dim=-1, p=2))
-        # fourier_feats = self.fourier_feats(x.view(h.shape[0], -1, 3))
-        # h = self.coord_proj(torch.cat((h, fourier_feats), dim=-1))
 
         batch = {
             "node_embeddings": h,
             "translations": t,
             "rotations": R,
             "node_mask": mask,
-            # "edge_embeddings": dists,
         }
 
-        # time_proj = self.proj(time_steps)
         output = self.encoder(batch, time_steps)
 
         if return_coords:
@@ -131,7 +109,7 @@ class FlashIPAEncoder(nn.Module):
             )
             return coords
 
-        return output["embs"]  # [B, N, hidden_size]
+        return output["embs"]
 
 
 class DiTEncoder(nn.Module):
@@ -189,9 +167,6 @@ class CrossAttentionEncoder(nn.Module):
             self.mlp_layers.append(
                 nn.Sequential(
                     nn.Linear(hidden_size, hidden_size * 3),
-                    # nn.ReLU(),
-                    # nn.Dropout(args.dropout),
-                    # nn.Linear(hidden_size, hidden_size),
                     GLU(hidden_size * 3, args, act="silu"),
                     nn.Linear(hidden_size * 3, hidden_size),
                 )
@@ -262,16 +237,15 @@ class EquiformerEncoder(nn.Module):
             dim=(
                 args.hidden_size // 2,
                 2,
-            ),  # dimensions per type, ascending, length must match number of degrees (num_degrees)
-            dim_head=(2, 2),  # dimension per attention head
-            heads=(2, 2),  # number of attention heads
-            num_linear_attn_heads=args.heads
-            // 4,  # number of global linear attention heads, can see all the neighbors
-            num_degrees=2,  # number of degrees
-            depth=args.depth // 2,  # depth of equivariant transformer
-            attend_self=True,  # attending to self or not
-            reduce_dim_out=True,  # whether to reduce out to dimension of 1, say for predicting new coordinates for type 1 features
-            l2_dist_attention=False,  # set to False to try out MLP attention
+            ),
+            dim_head=(2, 2),
+            heads=(2, 2),
+            num_linear_attn_heads=args.heads // 4,
+            num_degrees=2,
+            depth=args.depth // 2,
+            attend_self=True,
+            reduce_dim_out=True,
+            l2_dist_attention=False,
             valid_radius=15,
         )
 
@@ -286,7 +260,6 @@ class FAFormerEncoder(nn.Module):
     def __init__(self, args, d_input):
         super(FAFormerEncoder, self).__init__()
         self.faformer = FAFormer(
-            # d_input=args.hidden_size + 2 * args.fourier_dim,
             d_input=d_input,
             d_model=args.hidden_size // 2,
             n_layers=args.depth,
@@ -302,33 +275,10 @@ class FAFormerEncoder(nn.Module):
         self.fourier_feats = FourierFeats(args)
 
     def forward(self, h, x, mask, radius=15.0, pair_h=None):
-        # fourier_x = self.fourier_feats(x)
-        # h = torch.cat((h, fourier_x), dim=-1)
+
         embs, coords = self.faformer(h, x, radius, mask)
 
         return embs
-
-
-class EGNNEncoder(nn.Module):
-    def __init__(self, args):
-        super(EGNNEncoder, self).__init__()
-        self.egnn = EGNN_Network(
-            depth=args.depth,
-            dim=args.hidden_size,
-            fourier_features=args.fourier_dim,
-            m_dim=args.hidden_size // 2,
-            soft_edges=True,
-            valid_radius=40,
-        )
-
-    def forward(self, h, x, valid_radius=15.0):
-        # edge_idx, batch = get_graph(
-        #     x, valid_radius=valid_radius
-        # )
-
-        emb = self.egnn(h, x)
-
-        return emb
 
 
 normalizers = {
@@ -355,25 +305,12 @@ class SAEncoder(nn.Module):
             [normalizers[args.normalization](hsize) for _ in range(args.depth)]
         )
         self.lns_b = nn.ModuleList(
-            [
-                # normalizers[args.normalization](hsize)
-                nn.LayerNorm(hsize, bias=False)
-                for _ in range(args.depth)
-            ]
+            [nn.LayerNorm(hsize, bias=False) for _ in range(args.depth)]
         )
         self.feed_forwards = nn.ModuleList(
-            [
-                # nn.Sequential(
-                #     nn.Linear(hsize, hsize * 3),
-                #     nn.SiLU(),
-                #     nn.Linear(hsize * 3, hsize),
-                # )
-                # SwiGLU(args)
-                GLU(hsize, args, act="silu", bias=True)
-                for _ in range(args.depth)
-            ]
+            [GLU(hsize, args, act="silu", bias=True) for _ in range(args.depth)]
         )
-        # initialize all weights with xavier
+
         for att, ff in zip(self.attention_layers, self.feed_forwards):
             nn.init.kaiming_uniform_(att.in_proj_weight)
             nn.init.kaiming_uniform_(att.out_proj.weight)
@@ -389,7 +326,7 @@ class SAEncoder(nn.Module):
         self.heads = args.heads
 
     def forward(self, X, h, mask, sel, all_time_steps):
-        h = self.down_project(h)  # [B, N, C] -> [B, N, C//4]
+        h = self.down_project(h)
 
         B = X.shape[0]
         X = X.view(B, -1, 3)
@@ -508,12 +445,10 @@ class IPAEncoder(nn.Module):
 
     def forward(self, h, x, mask, pair_h=None):
         B, N = h.size(0), h.size(1)
-        x = x / 10  # angstrom to nm
+        x = x / 10
 
         rotations = repeat(torch.eye(3, device=x.device), "... -> b n ...", b=B, n=N)
         translations = x
-
-        prev_h = h
 
         for i in range(len(self.net)):
             if self.require_pairwise_repr:
@@ -529,8 +464,6 @@ class IPAEncoder(nn.Module):
                     h, rotations=rotations, translations=translations, mask=mask
                 )
 
-            # h = self.linears[i](h)
-
         return h
 
 
@@ -540,9 +473,7 @@ class PairResidueEncoder(nn.Module):
         self.W_pair = nn.Embedding(
             args.vocab_size * args.vocab_size, args.hidden_size // 2
         )
-        self.dist_coeffs = nn.Embedding(
-            args.vocab_size * args.vocab_size, 4 * 4
-        )  # backbone atoms only
+        self.dist_coeffs = nn.Embedding(args.vocab_size * args.vocab_size, 4 * 4)
         nn.init.zeros_(self.dist_coeffs.weight)
         self.dist_embedding = nn.Sequential(
             nn.Linear(4 * 4, args.hidden_size // 2),
@@ -561,10 +492,8 @@ class PairResidueEncoder(nn.Module):
         aa: [B, L], B is batch, L is the maximum length of the sequence
         X: [B, L, 4, 3], 4 is the number of atoms in each residue, 3 is the coordinates of each atom
         """
-        pair_idx = aa.unsqueeze(-1) * aa.unsqueeze(-2)  # [B, L_max, L_max]
-        pair_embedding = self.W_pair(pair_idx)  # [B, L_max, L_max, hidden_size]
-
-        # return pair_embedding * pair_mask # [B, L_max, L_max, hidden_size]
+        pair_idx = aa.unsqueeze(-1) * aa.unsqueeze(-2)
+        pair_embedding = self.W_pair(pair_idx)
 
         B, L = aa.size(0), aa.size(1)
 
@@ -575,14 +504,14 @@ class PairResidueEncoder(nn.Module):
                 ord=2,
             ).reshape(B, L, L, -1)
             / 10
-        )  # [B, L, L, 4]
-        c = F.softplus(self.dist_coeffs(pair_idx))  # [B, L, L, 4*4]
-        d_gauss = torch.exp(-c * d**2)  # [B, L, L, 4*4]
-        d_gauss = self.dist_embedding(d_gauss)  # [B, L, L, hidden_size]
+        )
+        c = F.softplus(self.dist_coeffs(pair_idx))
+        d_gauss = torch.exp(-c * d**2)
+        d_gauss = self.dist_embedding(d_gauss)
 
-        emb = torch.cat([pair_embedding, d_gauss], dim=-1)  # [B, L, L, hidden_size*2]
+        emb = torch.cat([pair_embedding, d_gauss], dim=-1)
 
-        return self.out_mlp(emb)  # [B, L, L, hidden_size]
+        return self.out_mlp(emb)
 
 
 class DeepSets(nn.Module):
@@ -608,7 +537,7 @@ class DeepSets(nn.Module):
         h: [B, N, D] tensor of features
         """
         h = self.phi(h)
-        # mean pool using mask
+
         h = h.sum(dim=1) / num_nonzero
 
         h = self.psi(h)

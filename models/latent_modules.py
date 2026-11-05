@@ -1,262 +1,14 @@
-import math
-import pdb
+from typing import Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from typing import Tuple, Optional
 
-from .encoders import FlashIPAEncoder
 from utils import ALPHABET, Features, randomly_rotate_and_translate
 
-
-class SinusoidalDistanceEmbedding(nn.Module):
-    def __init__(self, dim, max_period=10000.0):
-        super().__init__()
-        self.dim = dim
-        self.max_period = max_period
-
-        # Precompute the frequency divisors
-        # Log-space distribution ensures we capture multiple scales of distance equally
-        half_dim = dim // 2
-        div_term = torch.exp(
-            torch.arange(0, half_dim, 2).float() * -(math.log(max_period) / half_dim)
-        )
-        self.register_buffer("div_term", div_term)
-
-    def forward(self, dist):
-        """
-        dist: [B, N, M, 1] or [B, N, 1] - Raw distances (in Angstroms)
-        """
-        # Reshape for broadcasting: [..., 1] * [dim/2]
-        num_dims = dist.dim()
-        x = dist * self.div_term.view(*([1] * (num_dims - 1)), -1)
-
-        # Concatenate sin and cos
-        emb = torch.cat([torch.sin(x), torch.cos(x)], dim=-1)
-
-        return emb  # [B, N, M, dim]
-
-
-class ResidualEdgeEncoder(nn.Module):
-    def __init__(self, edge_dim: int, end: int = 180):
-        super(ResidualEdgeEncoder, self).__init__()
-        self.end = end
-        self.edge_dim = edge_dim
-
-        self.gaussian_embedding = GaussianSmearing(0.0, end, edge_dim)
-        self.lin1 = nn.Linear(edge_dim, edge_dim)
-        self.lin2 = nn.Linear(edge_dim, 1)
-
-    def forward(self, edge_dist: Tensor) -> Tensor:
-        """
-        edge_dist: (B, M, N) in [0, end]
-        returns: (B, M, N)
-        """
-        edge_emb_1 = self.gaussian_embedding[0](edge_dist)  # (B, M, N, edge_dim)
-        edge_emb = F.gelu(self.lin1(edge_emb_1))  # (B, M, N, edge_dim)
-        edge_emb = edge_emb + edge_emb_1  # residual connection
-        edge_emb = self.lin2(edge_emb).squeeze(-1)  # (B, M, N)
-        return edge_emb
-
-
-class RelativePositionalEncoding(nn.Module):
-    def __init__(self, max_len: int, dim: int):
-        super(RelativePositionalEncoding, self).__init__()
-        self.max_len = max_len
-        self.dim = dim
-        self.embedding = nn.Embedding(2 * max_len + 1, dim)
-        self.weights = nn.Parameter(torch.randn(dim, 1))
-
-    def forward(self, length: int) -> Tensor:
-        """
-        Return relative positional encodings for sequences of given length
-        Output shape: (length, length, dim)
-        """
-        range_vec = torch.arange(length, device=self.embedding.weight.device)
-        distance_mat = range_vec[None, :] - range_vec[:, None]  # (length, length)
-        distance_mat_clipped = (
-            torch.clamp(distance_mat, -self.max_len, self.max_len) + self.max_len
-        )  # shift to [0, 2*max_len]
-        embeddings = self.embedding(distance_mat_clipped)  # (length, length, dim)
-        # return self.lin(embeddings).unsqueeze(0).squeeze(-1) # (1, length, length)
-        return (
-            embeddings.matmul(self.weights).squeeze(-1).unsqueeze(0)
-        )  # (1, length, length)
-
-    def pair_relative_embeddings(self, len_q: int, len_k: int) -> Tensor:
-        """
-        Return relative positional encodings for pairs of sequences of given lengths
-        Output shape: (len_q + len_k, len_q + len_k, dim)
-        """
-        total_len = len_q + len_k
-        range_vec = torch.arange(total_len, device=self.embedding.weight.device)
-        distance_mat = range_vec[None, :] - range_vec[:, None]
-        distance_mat_clipped = (
-            torch.clamp(distance_mat, -self.max_len, self.max_len) + self.max_len
-        )
-        embeddings = self.embedding(distance_mat_clipped)
-        # return self.lin(embeddings).unsqueeze(0).squeeze(-1)  # (1, total_len, total_len)
-        return (
-            embeddings.matmul(self.weights).squeeze(-1).unsqueeze(0)
-        )  # (1, total_len, total_len)
-
-
-class ColumnPooling(nn.Module):
-    def __init__(self, dim):
-        super(ColumnPooling, self).__init__()
-        self.dim = dim
-        self.attention = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, 1))
-
-    def forward(self, x: Tensor, attn_mask: Tensor, direction="columns"):
-        """
-        Return weighted sum over the columns/rows
-        x: (B, N, M, D)
-        attn_mask: (B, N, M) or None
-        """
-        if direction == "rows":
-            x = x.transpose(1, 2)
-            if attn_mask is not None:
-                attn_mask = attn_mask.transpose(1, 2)
-
-        weights = self.attention(x)
-
-        if attn_mask is not None:
-            attn_mask = attn_mask.unsqueeze(-1)
-            weights = weights.masked_fill(~attn_mask, -1e9)
-
-        weights = F.softmax(weights, dim=2)  # (B, N, M, 1)
-        out = (x * weights).sum(dim=2)  # (B, N, D)
-
-        return out  # (B, N, D) if columns else (B, M, D)
-
-
-class MLP(nn.Module):
-    def __init__(
-        self,
-        in_dim,
-        hidden_dim,
-        out_dim,
-        num_layers=2,
-        bias=True,
-        normalizer=None,
-        activation=nn.SiLU(),
-    ):
-        super(MLP, self).__init__()
-        layers = []
-        for i in range(num_layers):
-            input_dim = in_dim if i == 0 else hidden_dim
-            output_dim = out_dim if i == num_layers - 1 else hidden_dim
-            layers.append(nn.Linear(input_dim, output_dim, bias=bias))
-            if i < num_layers - 1:
-                layers.append(activation)
-                if normalizer is not None:
-                    layers.append(normalizer(hidden_dim))
-
-        self.mlp = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.mlp(x)
-
-
-class ResidualBlock(nn.Module):
-    def __init__(self, module):
-        super(ResidualBlock, self).__init__()
-        self.module = module
-
-    def forward(self, x):
-        return x + self.module(x)
-
-
-class GaussianSmearing(nn.Module):
-    # used to embed the edge dists
-    def __init__(self, start=0.0, stop=5.0, num_gaussians=50):
-        super().__init__()
-        offset = torch.linspace(start, stop, num_gaussians)
-        self.num_gaussians = num_gaussians
-        self.coeff = -0.5 / (offset[1] - offset[0]).item() ** 2
-        self.register_buffer("offset", offset)
-
-    def forward(self, dist):
-        """
-        dist: (B, M, N)
-        returns: (B, M, N, num_gaussians)
-        """
-        dist = dist.unsqueeze(-1) - self.offset.view(1, 1, 1, -1)
-        return torch.exp(self.coeff * torch.pow(dist, 2))
-
-
-class BlockAdaLN(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.to_params = nn.Linear(dim, dim * 6)
-        nn.init.zeros_(self.to_params.weight)
-        nn.init.zeros_(self.to_params.bias)
-
-    def forward(self, cond):
-        return self.to_params(cond).chunk(6, dim=-1)
-
-
-class AdaLNZero(nn.Module):
-    """
-    Adaptive LayerNorm (timestep-conditioned) with zero init
-    """
-
-    def __init__(self, dim: int):
-        super().__init__()
-        self.norm = nn.LayerNorm(dim, eps=1e-6)
-        self.gamma = nn.Parameter(torch.zeros(dim))
-        self.beta = nn.Parameter(torch.zeros(dim))
-
-    def forward(self, x: Tensor, t_embed: Tensor):
-        # t_embed: (B, dim)
-        g = self.gamma * t_embed
-        b = self.beta * t_embed
-        return self.norm(x) * (1 + g) + b
-
-
-class SelfAttention(nn.Module):
-    def __init__(self, dim: int, heads: int, dropout: float = 0.0):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(
-            embed_dim=dim,
-            num_heads=heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-
-    def forward(self, x: Tensor, mask=None):
-        out, _ = self.attn(x, x, x, attn_mask=mask, need_weights=False)
-        return out
-
-
-class CrossAttention(nn.Module):
-    def __init__(self, dim: int, heads: int, dropout: float = 0.0):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(
-            embed_dim=dim,
-            num_heads=heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-
-    def forward(self, x: Tensor, context: Tensor, mask=None):
-        out, _ = self.attn(x, context, context, attn_mask=mask, need_weights=False)
-        return out
-
-
-class DiTMLP(nn.Module):
-    def __init__(self, dim: int, mult: int = 4):
-        super().__init__()
-        hidden = dim * mult
-        self.net = nn.Sequential(
-            nn.Linear(dim, hidden),
-            nn.SiLU(),
-            nn.Linear(hidden, dim),
-        )
-
-    def forward(self, x):
-        return self.net(x)
+from .common import BlockAdaLN, CrossAttention, SelfAttention
+from .encoders import FlashIPAEncoder
 
 
 class DiTBlock(nn.Module):
@@ -267,15 +19,10 @@ class DiTBlock(nn.Module):
         self.norm2 = nn.LayerNorm(dim)
         self.norm3 = nn.LayerNorm(dim)
 
-        # Self-attn part
         self.sa = SelfAttention(dim, heads, dropout)
-        # self.sa = TransformerBlock(dim, heads, mlp_ratio, dropout)
 
-        # Cross-attn part
         self.cross = CrossAttention(dim, heads, dropout)
-        # self.cross = CrossAttentionBlock(dim, heads, mlp_ratio, dropout)
 
-        # MLP
         self.mlp = nn.Sequential(
             nn.Linear(dim, dim * mlp_ratio),
             nn.SiLU(),
@@ -289,21 +36,20 @@ class DiTBlock(nn.Module):
         t_emb:  (B, D)
         mask:   (B, N) or (B, N, 1), True = valid, False = pad, or None
         """
-        x = x + cond  # token-level bias
+        x = x + cond
 
-        # Self-attention
         s1, sc1, g1, s2, sc2, g2 = self.block_adaln(t_embed)
 
         h = self.norm1(x)
         h = h * (1 + sc1.unsqueeze(1)) + s1.unsqueeze(1)
         h = self.sa(h, mask=mask)
-        # h = self.sa(h, attn_mask=mask)
+
         x = x + g1.unsqueeze(1) * h
 
         h = self.norm2(x)
         h = h * (1 + sc2.unsqueeze(1)) + s2.unsqueeze(1)
         h = self.cross(h, cond, mask=mask)
-        # h = self.cross(h, cond, attn_mask=mask)
+
         x = x + g2.unsqueeze(1) * h
 
         h = self.norm3(x)
@@ -348,7 +94,7 @@ class DiTConditioning(nn.Module):
         )
 
     def forward(self, t_emb):
-        return self.net(t_emb)  # (B, D)
+        return self.net(t_emb)
 
 
 class DiT(nn.Module):
@@ -364,138 +110,6 @@ class DiT(nn.Module):
         cond = self.cond2(context)
         x = self.backbone(x, cond, t, mask=mask)
         return self.out(x, cond)
-
-
-class DiTBlock_(nn.Module):
-    def __init__(self, dim, heads, mlp_ratio=4, cross=True, dropout=0.0):
-        super().__init__()
-        self.use_cross = cross
-
-        # Self-attn part
-        self.adaln1 = AdaLNZero(dim)
-        self.sa = SelfAttention(dim, heads, dropout)
-
-        # Cross-attn part (optional)
-        if cross:
-            self.adaln2 = AdaLNZero(dim)
-            self.ca = CrossAttention(dim, heads, dropout)
-
-        # MLP
-        self.adaln3 = AdaLNZero(dim)
-        self.ff = DiTMLP(dim, mlp_ratio)
-
-    def forward(self, x, t_embed, context=None, mask=None):
-        # Self-attention
-        x = x + self.sa(self.adaln1(x, t_embed), mask)
-
-        # Cross-attention
-        if self.use_cross and context is not None:
-            x = x + self.ca(self.adaln2(x, t_embed), context, mask)
-
-        # MLP
-        x = x + self.ff(self.adaln3(x, t_embed))
-        return x
-
-
-class DiTTransformer(nn.Module):
-    """
-    Diffusion model operating over latent tokens (B, L, D)
-
-    - z_t: noisy latents
-    - context: binder & target embeddings, shape (B, L_ctx, D)
-    """
-
-    def __init__(
-        self,
-        dim: int,
-        depth: int,
-        heads: int,
-        mlp_ratio: int = 4,
-        dropout: float = 0.0,
-        predict: str = "noise",  # {noise | x0}
-    ):
-        super().__init__()
-        self.predict = predict
-
-        # stack of blocks
-        self.blocks = nn.ModuleList(
-            [
-                DiTBlock(
-                    dim,
-                    heads,
-                    mlp_ratio,
-                    cross=True,  # want cross-attn in every block
-                    dropout=dropout,
-                )
-                for _ in range(depth)
-            ]
-        )
-
-        # final LN & linear
-        self.final_ln = nn.LayerNorm(dim)
-        self.head = nn.Linear(dim, dim)  # predict ε or x0
-
-    def forward(self, zt, context, t_embed, mask=None):
-        """
-        zt:      (B, L, D)
-        t_embed: (B, D)
-        context: (B, L_ctx, D)
-        """
-        x = zt
-        for block in self.blocks:
-            x = block(x, t_embed, context, mask)
-
-        x = self.final_ln(x)
-        out = self.head(x)
-
-        return out
-
-
-class FusionBlock(nn.Module):
-    def __init__(self, dim, heads, dropout):
-        super().__init__()
-        self.attn = TransformerBlock(dim, heads, mlp_ratio=4, dropout=dropout)
-        self.cross = CrossAttentionBlock(dim, heads, mlp_ratio=4, dropout=dropout)
-        # self.film = FiLM(dim, dim)
-        self.fuser = nn.Sequential(
-            nn.Linear(dim * 2, dim),
-            # nn.LayerNorm(dim),
-            nn.SiLU(),
-            nn.Linear(dim, dim),
-        )
-        self.adaln1 = AdaLNZero(dim)
-        self.adaln2 = AdaLNZero(dim)
-
-    def forward(self, x, context, noise_emb, res=None, attn_mask=None):
-        x = self.adaln1(x, noise_emb)
-        x1 = self.attn(x, attn_mask=attn_mask)
-        x2 = self.cross(x, context, attn_mask=attn_mask)
-
-        x = self.fuser(torch.cat([x1, x2], dim=-1))
-        # x = self.film(x, noise_emb)
-        x = self.adaln2(x, noise_emb)
-
-        if res is not None:
-            x = x + res
-
-        return x
-
-
-class FusionAttentionModule(nn.Module):
-    def __init__(self, latent_dim, heads, depth, dropout=0.0):
-        super().__init__()
-        self.layers = nn.ModuleList(
-            [FusionBlock(latent_dim, heads, dropout) for _ in range(depth)]
-        )
-
-    def forward(self, x, context, t, attn_mask=None):
-        res = x
-
-        for layer in self.layers:
-            x = layer(x, context, t, res=res, attn_mask=attn_mask)
-            res = x
-
-        return x
 
 
 class CustomCrossAttentionTransformer(nn.Module):
@@ -559,7 +173,7 @@ class CrossAttentionBlock(nn.Module):
         )
 
     def reshape_heads(self, x: Tensor) -> Tensor:
-        # (B, T, C) -> (B, heads, T, dim_head)
+
         B = x.shape[0]
         return x.view(B, -1, self.heads, self.dim_head).transpose(1, 2)
 
@@ -584,20 +198,18 @@ class CrossAttentionBlock(nn.Module):
 
         x_norm = self.norm1(x)
 
-        q = self.to_q(x_norm)  # (B, N, C)
-        kv = self.to_kv(context)  # (B, M, 2C)
+        q = self.to_q(x_norm)
+        kv = self.to_kv(context)
         k, v = kv.chunk(2, dim=-1)
 
-        q = self.reshape_heads(q)  # (B, H, N, Dh)
-        k = self.reshape_heads(k)  # (B, H, M, Dh)
-        v = self.reshape_heads(v)  # (B, H, M, Dh)
+        q = self.reshape_heads(q)
+        k = self.reshape_heads(k)
+        v = self.reshape_heads(v)
 
-        attn = torch.matmul(q, k.transpose(-2, -1))  # (B, H, N, M)
+        attn = torch.matmul(q, k.transpose(-2, -1))
         attn = attn / (self.dim_head**0.5)
 
-        # ---- Apply mask ----
         if attn_mask is not None:
-            # ensure broadcastable: (B, 1, N, M)
             if attn_mask.dim() == 3:
                 attn_mask = attn_mask.unsqueeze(1)
 
@@ -605,8 +217,8 @@ class CrossAttentionBlock(nn.Module):
 
         attn = F.softmax(attn, dim=-1)
 
-        out = torch.matmul(attn, v)  # (B, H, N, Dh)
-        out = out.transpose(1, 2).contiguous().view(B, N, C)  # merge heads
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).contiguous().view(B, N, C)
         out = self.proj_out(out)
 
         x = x + out
@@ -697,24 +309,23 @@ class TransformerBlock(nn.Module):
 
         x_norm = self.norm1(x)
 
-        # qkv: (B, N, 3 * heads * dim_head)
         qkv = self.qkv(x_norm)
         qkv = qkv.reshape(B, N, self.heads, 3 * self.dim_head)
-        qkv = qkv.permute(0, 2, 1, 3)  # (B, heads, N, 3 * dim_head)
-        q, k, v = qkv.chunk(3, dim=-1)  # each: (B, heads, N, dim_head)
+        qkv = qkv.permute(0, 2, 1, 3)
+        q, k, v = qkv.chunk(3, dim=-1)
 
-        qk_prod = torch.matmul(q, k.transpose(-2, -1))  # (B, heads, N, N)
+        qk_prod = torch.matmul(q, k.transpose(-2, -1))
         qk_prod = qk_prod / (self.dim_head**0.5)
 
         if attn_mask is not None:
             qk_prod = qk_prod + attn_mask
 
         attn_weights = F.softmax(qk_prod, dim=-1)
-        attn_out = torch.matmul(attn_weights, v)  # (B, heads, N, dim_head)
+        attn_out = torch.matmul(attn_weights, v)
 
         attn_out = attn_out.permute(0, 2, 1, 3).reshape(
             B, N, self.heads * self.dim_head
-        )  # (B, N, dim)
+        )
         x = x + attn_out
 
         x_norm = self.norm2(x)
@@ -723,83 +334,6 @@ class TransformerBlock(nn.Module):
         return x
 
 
-class GLU(nn.Module):
-    def __init__(self, dim, act="relu", bias=False):
-        super(GLU, self).__init__()
-
-        if act == "sigmoid":
-            self.act = nn.Sigmoid()
-        elif act == "relu":
-            self.act = nn.ReLU()
-        elif act == "silu":
-            self.act = nn.SiLU()
-        elif act == "gelu":
-            self.act = nn.GELU()
-        elif act == "tanh":
-            self.act = nn.Tanh()
-        else:
-            raise NotImplementedError
-
-        self.gate = nn.Sequential(
-            nn.Linear(dim, dim * 2, bias=bias),
-            self.act,
-            nn.Linear(dim * 2, dim * 2, bias=bias),
-        )
-
-    def forward(self, x):
-        gate = self.gate(x)
-        x, gate = gate.chunk(2, dim=-1)
-
-        return x * self.act(gate)
-
-
-class FiLM(nn.Module):
-    """
-    Feature-wise Linear Modulation: h -> gamma(z) * h + beta(z)
-    """
-
-    def __init__(self, latent_dim: int, feature_dim: int):
-        super().__init__()
-        self.fc = nn.Linear(latent_dim, feature_dim * 2)
-
-        nn.init.zeros_(self.fc.weight)
-        nn.init.zeros_(self.fc.bias)
-
-    def forward(self, h: Tensor, t: Tensor) -> Tensor:
-        """
-        h: (B, N, feature_dim)
-        z: (B, 1, latent_dim)
-        """
-        gamma, beta = self.fc(t).chunk(
-            2, dim=-1
-        )  # (B,1,feature_dim), (B,1,feature_dim)
-        return h * gamma + beta
-
-
-class ConvFiLM(nn.Module):
-    """
-    Feature-wise Linear Modulation: h -> gamma(z) * h + beta(z)
-    """
-
-    def __init__(self, latent_dim: int, channels: int):
-        super().__init__()
-        self.fc = nn.Linear(latent_dim, channels * 2)
-
-        # nn.init.zeros_(self.fc.weight)
-        # nn.init.zeros_(self.fc.bias)
-
-    def forward(self, h: Tensor, z: Tensor) -> Tensor:
-        """
-        h: (B, C, H, W)
-        z: (B, latent_dim)
-        """
-        gamma, beta = self.fc(z).chunk(2, dim=-1)  # (B,C), (B,C)
-        gamma = gamma.unsqueeze(-1).unsqueeze(-1)  # (B,C,1,1)
-        beta = beta.unsqueeze(-1).unsqueeze(-1)  # (B,C,1,1)
-        return h * (1 + gamma) + beta
-
-
-# For diffusion conditioning
 class ProteinEncoder(nn.Module):
     def __init__(
         self,
@@ -876,7 +410,7 @@ class ProteinEncoder(nn.Module):
         self, binder: Features, target: Features
     ) -> Tuple[Tensor, Tensor]:
         bind_torsion, tgt_torsion = binder.T, target.T
-        bind_curvature, tgt_curvature = binder.C, target.C
+        _bind_curvature, _tgt_curvature = binder.C, target.C
 
         B, M, N = bind_torsion.size(0), bind_torsion.size(1), tgt_torsion.size(1)
 
@@ -907,7 +441,7 @@ class ProteinEncoder(nn.Module):
         tgt_mask: Tensor,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         max_length = max(bind_H.size(1), tgt_H.size(1))
-        # pad to max length for efficient batching
+
         pad_bind_H = F.pad(bind_H, (0, 0, 0, max_length - bind_H.size(1)), value=0.0)
         pad_tgt_H = F.pad(tgt_H, (0, 0, 0, max_length - tgt_H.size(1)), value=0.0)
         pad_bind_X = F.pad(
@@ -939,8 +473,8 @@ class ProteinEncoder(nn.Module):
         bind_X, bind_S, bind_A, *_ = binder
         tgt_X, tgt_S, tgt_A, *_ = target
 
-        bind_mask_ca = bind_A[:, :, self.bb].clamp(max=1).bool()  # [B, M]
-        tgt_mask_ca = tgt_A[:, :, self.bb].clamp(max=1).bool()  # [B, N]
+        bind_mask_ca = bind_A[:, :, self.bb].clamp(max=1).bool()
+        tgt_mask_ca = tgt_A[:, :, self.bb].clamp(max=1).bool()
 
         B, M, N = bind_S.size(0), bind_S.size(1), tgt_S.size(1)
 
@@ -959,8 +493,8 @@ class ProteinEncoder(nn.Module):
         if bind_H is None and tgt_H is None:
             bind_H, tgt_H = self.embed(binder, target)
 
-            bind_H = bind_H.view(B, M, self.sel, -1).sum(dim=2)  # pool to [B, M, D]
-            tgt_H = tgt_H.view(B, N, self.sel, -1).sum(dim=2)  # pool to [B, N, D]
+            bind_H = bind_H.view(B, M, self.sel, -1).sum(dim=2)
+            tgt_H = tgt_H.view(B, N, self.sel, -1).sum(dim=2)
 
         bind_H, tgt_H, bind_X, tgt_X, bind_mask_ca, tgt_mask_ca = (
             self.pad_to_max_length(
@@ -973,7 +507,7 @@ class ProteinEncoder(nn.Module):
             )
         )
 
-        combined_H = torch.cat([bind_H, tgt_H], dim=0)  # (2B, L, D)
+        combined_H = torch.cat([bind_H, tgt_H], dim=0)
         combined_X = torch.cat([bind_X, tgt_X], dim=0)
         combined_mask = torch.cat([bind_mask_ca, tgt_mask_ca], dim=0)
 
@@ -989,7 +523,6 @@ class ProteinEncoder(nn.Module):
         encoded_H = output
         bind_out, tgt_out = torch.chunk(encoded_H, 2, dim=0)
 
-        # undo the padding
         bind_out = bind_out[:, :M, :].contiguous()
         tgt_out = tgt_out[:, :N, :].contiguous()
 

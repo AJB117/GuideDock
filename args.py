@@ -1,4 +1,5 @@
 import argparse
+
 from utils import ALPHABET
 
 
@@ -70,7 +71,20 @@ def parse_args():
     parser.add_argument("--resolution", type=str, default="backbone")
     parser.add_argument("--anneal_rate", type=float, default=0.95)
     parser.add_argument("--normalization", type=str, default="layer")
-    parser.add_argument("--encoder", type=str, default="flash_ipa")
+    parser.add_argument(
+        "--encoder",
+        choices=[
+            "sa",
+            "lstm",
+            "ipa",
+            "faformer",
+            "equiformer",
+            "flash_ipa",
+            "cross",
+            "dit",
+        ],
+        default="flash_ipa",
+    )
     parser.add_argument("--noise_scaler", type=str, default="cosine")
     parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--require_pairwise_repr", action="store_true", default=False)
@@ -142,7 +156,7 @@ def parse_args():
     parser.add_argument(
         "--num_edge_feats",
         type=int,
-        default=2,
+        default=16,
         help="Number of Gaussians for distance embedding",
     )
     parser.add_argument(
@@ -195,7 +209,7 @@ def parse_args():
     parser.add_argument(
         "--target_mode",
         type=str,
-        choices=["distances", "contact"],
+        choices=["distances"],
         default="distances",
         help="Target mode for VAE",
     )

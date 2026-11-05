@@ -1,9 +1,8 @@
-#!/usr/bin/env python3
-
 import argparse
 import pickle
-import torch
 from collections import Counter
+
+import torch
 
 
 def load_file(path):
@@ -18,22 +17,21 @@ def load_file(path):
 
 
 def classify_capri(fnat, lrmsd, irmsd):
-    # Incorrect
+
     if (fnat < 0.1) or (lrmsd > 10.0 and irmsd > 4.0):
         return "Incorrect"
 
-    # High
     if (fnat >= 0.5) and (lrmsd <= 1.0 or irmsd <= 1.0):
         return "High"
 
-    # Medium
-    if ((fnat >= 0.3 and fnat < 0.5) and (lrmsd <= 5.0 or irmsd <= 2.0)) or \
-       ((fnat >= 0.5) and (lrmsd > 1.0 and irmsd > 1.0)):
+    if ((fnat >= 0.3 and fnat < 0.5) and (lrmsd <= 5.0 or irmsd <= 2.0)) or (
+        (fnat >= 0.5) and (lrmsd > 1.0 and irmsd > 1.0)
+    ):
         return "Medium"
 
-    # Acceptable
-    if ((fnat >= 0.1 and fnat < 0.3) and (lrmsd <= 10.0 or irmsd <= 4.0)) or \
-       ((fnat >= 0.3) and (lrmsd > 5.0 and irmsd > 2.0)):
+    if ((fnat >= 0.1 and fnat < 0.3) and (lrmsd <= 10.0 or irmsd <= 4.0)) or (
+        (fnat >= 0.3) and (lrmsd > 5.0 and irmsd > 2.0)
+    ):
         return "Acceptable"
 
     return "Incorrect"
@@ -46,14 +44,10 @@ def compute_capri(meter, include_bad=False):
 
     assert len(fnats) == len(lrmsds) == len(irmsds), "Metric list lengths mismatch"
 
-    labels = [
-        classify_capri(f, l, i)
-        for f, l, i in zip(fnats, lrmsds, irmsds)
-    ]
+    labels = [classify_capri(f, l, i) for f, l, i in zip(fnats, lrmsds, irmsds)]
 
     counts = Counter(labels)
 
-    # Optionally include filtered bad cases
     if include_bad and hasattr(meter, "bad_case"):
         counts["Incorrect"] += meter.bad_case
 
@@ -62,7 +56,7 @@ def compute_capri(meter, include_bad=False):
     results = {
         k: {
             "count": counts.get(k, 0),
-            "percent": 100.0 * counts.get(k, 0) / total if total > 0 else 0.0
+            "percent": 100.0 * counts.get(k, 0) / total if total > 0 else 0.0,
         }
         for k in ["High", "Medium", "Acceptable", "Incorrect"]
     }
@@ -71,10 +65,17 @@ def compute_capri(meter, include_bad=False):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Compute CAPRI metrics from saved meter object")
-    parser.add_argument("path", help="Path to .pt/.pth/.pkl file containing {'meter': meter}")
-    parser.add_argument("--include_bad", action="store_true",
-                        help="Include filtered bad cases as Incorrect")
+    parser = argparse.ArgumentParser(
+        description="Compute CAPRI metrics from saved meter object"
+    )
+    parser.add_argument(
+        "path", help="Path to .pt/.pth/.pkl file containing {'meter': meter}"
+    )
+    parser.add_argument(
+        "--include_bad",
+        action="store_true",
+        help="Include filtered bad cases as Incorrect",
+    )
     args = parser.parse_args()
 
     data = load_file(args.path)

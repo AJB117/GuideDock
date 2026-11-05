@@ -1,14 +1,10 @@
-import pdb
+from contextlib import contextmanager
+
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import autocast
-from contextlib import contextmanager
-from torch import nn, einsum
-
-from einops.layers.torch import Rearrange
 from einops import rearrange, repeat
-
-# helpers
+from einops.layers.torch import Rearrange
+from torch import einsum, nn
 
 
 def exists(val):
@@ -31,9 +27,6 @@ def disable_tf32():
     torch.backends.cuda.matmul.allow_tf32 = orig_value
 
 
-# classes
-
-
 class InvariantPointAttention(nn.Module):
     def __init__(
         self,
@@ -53,19 +46,13 @@ class InvariantPointAttention(nn.Module):
         self.heads = heads
         self.require_pairwise_repr = require_pairwise_repr
 
-        # num attention contributions
-
         num_attn_logits = 3 if require_pairwise_repr else 2
-
-        # qkv projection for scalar attention (normal)
 
         self.scalar_attn_logits_scale = (num_attn_logits * scalar_key_dim) ** -0.5
 
         self.to_scalar_q = nn.Linear(dim, scalar_key_dim * heads, bias=False)
         self.to_scalar_k = nn.Linear(dim, scalar_key_dim * heads, bias=False)
         self.to_scalar_v = nn.Linear(dim, scalar_value_dim * heads, bias=False)
-
-        # qkv projection for point attention (coordinate and orientation aware)
 
         point_weight_init_value = torch.log(torch.exp(torch.full((heads,), 1.0)) - 1.0)
         self.point_weights = nn.Parameter(point_weight_init_value)
@@ -78,8 +65,6 @@ class InvariantPointAttention(nn.Module):
         self.to_point_k = nn.Linear(dim, point_key_dim * heads * 3, bias=False)
         self.to_point_v = nn.Linear(dim, point_value_dim * heads * 3, bias=False)
 
-        # pairwise representation projection to attention bias
-
         pairwise_repr_dim = (
             default(pairwise_repr_dim, dim) if require_pairwise_repr else 0
         )
@@ -90,8 +75,6 @@ class InvariantPointAttention(nn.Module):
             self.to_pairwise_attn_bias = nn.Sequential(
                 nn.Linear(pairwise_repr_dim, heads), Rearrange("b ... h -> (b h) ...")
             )
-
-        # combine out - scalar dim + pairwise dim + point dim * (3 for coordinates in R3 and then 1 for norm)
 
         self.to_out = nn.Linear(
             heads * (scalar_value_dim + pairwise_repr_dim + point_value_dim * (3 + 1)),
@@ -112,8 +95,6 @@ class InvariantPointAttention(nn.Module):
             "pairwise representation must be given as second argument"
         )
 
-        # get queries, keys, values for scalar and point (coordinate-aware) attention pathways
-
         q_scalar, k_scalar, v_scalar = (
             self.to_scalar_q(x),
             self.to_scalar_k(x),
@@ -125,8 +106,6 @@ class InvariantPointAttention(nn.Module):
             self.to_point_k(x),
             self.to_point_v(x),
         )
-
-        # split out heads
 
         q_scalar, k_scalar, v_scalar = map(
             lambda t: rearrange(t, "b n (h d) -> (b h) n d", h=h),
@@ -140,8 +119,6 @@ class InvariantPointAttention(nn.Module):
         rotations = repeat(rotations, "b n r1 r2 -> (b h) n r1 r2", h=h)
         translations = repeat(translations, "b n c -> (b h) n () c", h=h)
 
-        # rotate qkv points into global frame
-
         q_point = (
             einsum("b n d c, b n c r -> b n d r", q_point, rotations) + translations
         )
@@ -151,8 +128,6 @@ class InvariantPointAttention(nn.Module):
         v_point = (
             einsum("b n d c, b n c r -> b n d r", v_point, rotations) + translations
         )
-
-        # derive attn logits for scalar and pairwise
 
         attn_logits_scalar = (
             einsum("b i d, b j d -> b i j", q_scalar, k_scalar)
@@ -164,8 +139,6 @@ class InvariantPointAttention(nn.Module):
                 self.to_pairwise_attn_bias(pairwise_repr)
                 * self.pairwise_attn_logits_scale
             )
-
-        # derive attn logits for point attention
 
         point_qk_diff = rearrange(q_point, "b i d c -> b i () d c") - rearrange(
             k_point, "b j d c -> b () j d c"
@@ -179,13 +152,10 @@ class InvariantPointAttention(nn.Module):
             point_dist * point_weights * self.point_attn_logits_scale
         )
 
-        # combine attn logits
         attn_logits = attn_logits_scalar + attn_logits_points
 
         if require_pairwise_repr:
             attn_logits = attn_logits + attn_logits_pairwise
-
-        # mask
 
         if exists(mask):
             mask = rearrange(mask, "b i -> b i ()") * rearrange(mask, "b j -> b () j")
@@ -193,16 +163,9 @@ class InvariantPointAttention(nn.Module):
             mask_value = max_neg_value(attn_logits)
             attn_logits = attn_logits.masked_fill(~mask, mask_value)
 
-        # attention
-
         attn = attn_logits.softmax(dim=-1)
 
-        # with disable_tf32(), autocast(enabled = False):
         with disable_tf32():
-            # disable TF32 for precision
-
-            # aggregate values
-
             results_scalar = einsum("b i j, b j d -> b i d", attn, v_scalar)
 
             attn_with_heads = rearrange(attn, "(b h) i j -> b h i j", h=h)
@@ -212,11 +175,7 @@ class InvariantPointAttention(nn.Module):
                     "b h i j, b i j d -> b h i d", attn_with_heads, pairwise_repr
                 )
 
-            # aggregate point values
-
             results_points = einsum("b i j, b j d c -> b i d c", attn, v_point)
-
-            # rotate aggregated point values back into local frame
 
             results_points = einsum(
                 "b n d c, b n c r -> b n d r",
@@ -226,8 +185,6 @@ class InvariantPointAttention(nn.Module):
             results_points_norm = torch.sqrt(
                 torch.square(results_points).sum(dim=-1) + eps
             )
-
-        # merge back heads
 
         results_scalar = rearrange(results_scalar, "(b h) n d -> b n (h d)", h=h)
         results_points = rearrange(results_points, "(b h) n d c -> b n (h d c)", h=h)
@@ -241,13 +198,8 @@ class InvariantPointAttention(nn.Module):
             results_pairwise = rearrange(results_pairwise, "b h n d -> b n (h d)", h=h)
             results = (*results, results_pairwise)
 
-        # concat results and project out
-
         results = torch.cat(results, dim=-1)
         return self.to_out(results)
-
-
-# one transformer block based on IPA
 
 
 def FeedForward(dim, mult=1.0, num_layers=2, act=nn.SiLU):
@@ -278,7 +230,6 @@ class SwiGLU(nn.Module):
         self.layers_V = nn.ModuleList([])
         self.layers_W_2 = nn.ModuleList([])
 
-        # dim_hidden = dim * mult
         dim_hidden = dim
 
         for ind in range(num_layers):
@@ -304,8 +255,8 @@ class IPABlock(nn.Module):
         *,
         dim,
         ff_mult=1,
-        ff_num_layers=3,  # in the paper, they used 3 layer transition (feedforward) block
-        post_norm=True,  # in the paper, they used post-layernorm - offering pre-norm as well
+        ff_num_layers=3,
+        post_norm=True,
         post_attn_dropout=0.0,
         post_ff_dropout=0.0,
         use_swiglu=False,
@@ -319,7 +270,7 @@ class IPABlock(nn.Module):
         self.post_attn_dropout = nn.Dropout(post_attn_dropout)
 
         self.ff_norm = nn.LayerNorm(dim)
-        # self.ff = FeedForward(dim, mult=ff_mult, num_layers=ff_num_layers)
+
         if use_swiglu:
             self.ff = SwiGLU(dim, mult=ff_mult, num_layers=ff_num_layers)
         else:
@@ -342,12 +293,6 @@ class IPABlock(nn.Module):
         return x
 
 
-# add an IPA Transformer - iteratively updating rotations and translations
-
-# this portion is not accurate to AF2, as AF2 applies a FAPE auxiliary loss on each layer, as well as a stop gradient on the rotations
-# just an attempt to see if this could evolve to something more generally usable
-
-
 class IPATransformer(nn.Module):
     def __init__(
         self,
@@ -361,8 +306,6 @@ class IPATransformer(nn.Module):
     ):
         super().__init__()
 
-        # using quaternion functions from pytorch3d
-
         try:
             from pytorch3d.transforms import quaternion_multiply, quaternion_to_matrix
 
@@ -374,11 +317,7 @@ class IPATransformer(nn.Module):
             )
             raise err
 
-        # embedding
-
         self.token_emb = nn.Embedding(num_tokens, dim) if exists(num_tokens) else None
-
-        # layers
 
         self.layers = nn.ModuleList([])
         for _ in range(depth):
@@ -386,11 +325,7 @@ class IPATransformer(nn.Module):
                 nn.ModuleList([IPABlock(dim=dim, **kwargs), nn.Linear(dim, 6)])
             )
 
-        # whether to detach rotations or not, for stability during training
-
         self.detach_rotations = detach_rotations
-
-        # output
 
         self.predict_points = predict_points
 
@@ -417,20 +352,12 @@ class IPATransformer(nn.Module):
         if exists(self.token_emb):
             x = self.token_emb(x)
 
-        # if no initial quaternions passed in, start from identity
-
         if not exists(quaternions):
-            quaternions = torch.tensor(
-                [1.0, 0.0, 0.0, 0.0], device=device
-            )  # initial rotations
+            quaternions = torch.tensor([1.0, 0.0, 0.0, 0.0], device=device)
             quaternions = repeat(quaternions, "d -> b n d", b=b, n=n)
-
-        # if not translations passed in, start from identity
 
         if not exists(translations):
             translations = torch.zeros((b, n, 3), device=device)
-
-        # go through the layers and apply invariant point attention and feedforward
 
         for block, to_update in self.layers:
             rotations = quaternion_to_matrix(quaternions)
@@ -444,8 +371,6 @@ class IPATransformer(nn.Module):
                 rotations=rotations,
                 translations=translations,
             )
-
-            # update quaternion and translation
 
             quaternion_update, translation_update = to_update(x).chunk(2, dim=-1)
             quaternion_update = F.pad(quaternion_update, (1, 0), value=1.0)

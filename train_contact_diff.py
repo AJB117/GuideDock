@@ -1,267 +1,27 @@
-import pdb
-import os
 import argparse
-import torch
-import torch.nn.functional as F
-import pytorch_lightning as L
+import os
+from pprint import pprint
+
 import matplotlib.pyplot as plt
 import numpy as np
-
-from pprint import pprint
-from torch import Tensor
+import pytorch_lightning as L
+import torch
+import torch.nn.functional as F
 from pytorch_lightning import Trainer
-from pytorch_lightning.tuner import Tuner
-from pytorch_lightning.callbacks import ModelCheckpoint, Callback
+from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
-from tqdm import tqdm
-from typing import Optional
-from copy import deepcopy
+from pytorch_lightning.tuner import Tuner
+from torch import Tensor
 
+from datasets.datamodule import PPIDataModule
 from models.distance_fm import LatentFlowMatching
-from utils import (
-    Features,
-    recursive_to,
-    save_structures_ca,
-    batched_solve_mds,
-    make_block_weights,
-    batched_solve_mds_weighted,
-    idx_to_seq,
-    kabsch,
-    mds_kabsch,
-    kabsch_best,
-    Meter_Unbound_Bound,
-)
-
-from datasets import (
-    build_dataset,
-    make_protein_collate_fn,
-    build_dataloader,
-)
 from train_contact_vae import LitContactVAE
-
-
-def coords_from_distances(binder: Features, target: Features, pred_distances: Tensor):
-    binder_internal_dist = torch.cdist(
-        binder.X[:, :, 1], binder.X[:, :, 1]
-    )  # (B, M, M)
-    target_internal_dist = torch.cdist(
-        target.X[:, :, 1], target.X[:, :, 1]
-    )  # (B, N, N)
-
-    full_distances = torch.zeros(
-        binder_internal_dist.size(0),
-        binder_internal_dist.size(1) + target_internal_dist.size(1),
-        binder_internal_dist.size(1) + target_internal_dist.size(1),
-        device=pred_distances.device,
-    )
-    M, N = binder_internal_dist.size(1), target_internal_dist.size(1)
-    full_distances[:, :M, :M] = binder_internal_dist
-    full_distances[:, M:, M:] = target_internal_dist
-
-    full_distances[:, :M, M:] = pred_distances
-    full_distances[:, M:, :M] = pred_distances.transpose(1, 2)
-    full_distances = full_distances.double().cpu()
-
-    # coords = batched_solve_mds(full_distances)  # (B, M+N, 3)
-    W = make_block_weights(
-        B=binder_internal_dist.size(0),
-        M=M,
-        N=N,
-        w_internal=1.0,
-        w_cross=0.2,
-        device=full_distances.device,
-    )
-    coords = batched_solve_mds_weighted(
-        full_distances, W=W, refine_iters=200, lr=5e-2, verbose=True
-    )
-
-    # binder_coords = torch.from_numpy(coords[:, :M, :]).float()
-
-    # return torch.from_numpy(coords).float()
-    return coords.float()
-
-
-def align_by_receptor(binder: Features, target: Features, pred_coords: Tensor):
-    target_ca = target.X[:, :, 1]  # (B, N, 3)
-    B, N = target_ca.size(0), target_ca.size(1)
-
-    pred_target_coords = pred_coords[:, -N:, :]  # (B, N, 3)
-
-    _, R, t = kabsch_best(pred_target_coords.cpu(), target_ca.cpu())
-    aligned_coords = (torch.bmm(R, pred_coords.transpose(1, 2)).transpose(1, 2)) + t
-
-    # CA only, so now we align binder.X to aligned_coords
-    # aligned_binder_coords = aligned_coords[:, : binder.X.size(1), :].cuda()
-
-    # aligned_binder_coords, R, t = kabsch(
-    #     binder.X[:, :, 1].to(torch.float32), aligned_binder_coords.to(torch.float32)
-    # )
-    # aligned_binder_coords = (
-    #     torch.bmm(R, binder.X.float().view(B, -1, 3).transpose(1, 2)).transpose(1, 2)
-    # ) + t
-
-    # return aligned_binder_coords
-    return aligned_coords
-
-
-class EMACallback(Callback):
-    def __init__(self, decay=0.9999, every_n_steps: int = 10):
-        self.decay = decay
-        self.every_n_steps = every_n_steps
-        self.module_pair_list = []
-
-    def on_pretrain_routine_start(self, trainer, pl_module) -> None:
-        def forward_wrapper(module, org, ema):
-            def forward(*args, **kwargs):
-                return org(*args, **kwargs) if module.training else ema(*args, **kwargs)
-
-            return forward
-
-        modules = list(
-            filter(
-                lambda x: len(list(x[1].parameters())) > 0,
-                pl_module.named_children(),
-            )
-        )
-
-        for name, module in modules:
-            ema_module = deepcopy(module)
-            self.module_pair_list.append((ema_module, module))
-            pl_module.add_module(f"EMA_{name}", ema_module)
-            module.forward_bc = module.forward
-            module.forward = forward_wrapper(
-                module, module.forward_bc, ema_module.forward
-            )
-
-    def on_after_backward(self, trainer, pl_module) -> None:
-        step = trainer.global_step
-
-        # Only update EMA every N steps
-        if step % self.every_n_steps != 0:
-            return
-
-        for ema_module, module in self.module_pair_list:
-            self._update(
-                ema_module,
-                module,
-                update_fn=lambda e, m: self.decay * e + (1.0 - self.decay) * m,
-            )
-
-    def _update(self, ema_module, module, update_fn):
-        with torch.no_grad():
-            for ema_v, model_v in zip(
-                ema_module.state_dict().values(), module.state_dict().values()
-            ):
-                ema_v.copy_(update_fn(ema_v, model_v))
-
-
-def get_latent_mean_std(dataloader, vae):
-    all_latents = []
-    # try:
-    #     # per_dim_mean, per_dim_std = torch.load("latent_mean_std_all.pt").values()
-    #     per_dim_mean, per_dim_std = torch.load("latent_mean_std.pt").values()
-    #     print("Loaded precomputed latent mean and std.")
-    # except FileNotFoundError:
-    print("Computing latent mean and std over training set...")
-    for binder, target in tqdm(dataloader):
-        binder = recursive_to(binder, vae.device)
-        target = recursive_to(target, vae.device)
-
-        bind_mask = binder.A[:, :, 1].clamp(max=1).bool()  # (B, M)
-        tgt_mask = target.A[:, :, 1].clamp(max=1).bool()
-
-        binder_ca = binder.X[:, :, 1]
-        target_ca = target.X[:, :, 1]
-
-        # Distances (Å)
-        x = torch.cdist(binder_ca, target_ca)
-
-        # Forward pass through VAE to get latents
-        with torch.no_grad():
-            # [B, M+N, latent_dim]
-            z  = vae.vae.get_latents(x, binder, target)
-            z = (
-                z * torch.cat([bind_mask, tgt_mask], dim=1).unsqueeze(-1).float()
-            )  # Mask out padded residues
-
-            non_zero_latents = z[
-                z.abs().sum(dim=-1) > 0
-            ]  # [num_residues, latent_dim]
-            all_latents.append(non_zero_latents)
-
-    all_latents = torch.cat(all_latents, dim=0)  # [total_residues, latent_dim]
-
-    per_dim_mean = all_latents.mean(dim=0)
-    per_dim_std = all_latents.std(dim=0)
-
-    torch.save(
-        {"mean": per_dim_mean, "std": per_dim_std},
-        "latent_mean_std_all_esm2.pt",
-    )
-
-    return per_dim_mean, per_dim_std
-
-
-class PPIDataModule(L.LightningDataModule):
-    """PyTorch Lightning DataModule for PPI docking."""
-
-    def __init__(self, args):
-        super().__init__()
-        self.args = args
-        self.embedding = None
-
-    def setup(self, stage: Optional[str] = None):
-        """Setup datasets and embedding."""
-        self.train_ds, self.val_ds, self.sample_val_ds, self.test_ds = build_dataset(
-            self.args
-        )
-
-        if self.args.embedding:
-            print(f"Using embedding from {self.args.embedding}")
-            self.embedding = torch.load(
-                self.args.embedding, map_location=torch.device("cpu")
-            )
-            # self.embedding.share_memory_()
-
-        self.collate = make_protein_collate_fn(
-            embedding=self.embedding,
-            args=self.args,
-            device=None,  # Lightning handles device placement
-        )
-
-    def train_dataloader(self):
-        return build_dataloader(
-            self.train_ds,
-            batch_size=self.args.diffusion_batch_size,
-            shuffle=True,
-            collate_fn=self.collate,
-            pad_last_to_full=False,
-            infinite=False,
-            num_workers=8,
-            train_mode=False,
-        )
-
-    def val_dataloader(self):
-        return build_dataloader(
-            self.val_ds,
-            batch_size=self.args.diffusion_batch_size,
-            shuffle=False,
-            collate_fn=self.collate,
-            pad_last_to_full=False,
-            infinite=False,
-            num_workers=8,
-        )
-
-    def test_dataloader(self):
-        return build_dataloader(
-            self.test_ds,
-            batch_size=self.args.diffusion_batch_size,
-            shuffle=False,
-            collate_fn=self.collate,
-            pad_last_to_full=False,
-            infinite=False,
-            num_workers=8,
-        )
+from utils import (
+    EMACallback,
+    Features,
+    Meter_Unbound_Bound,
+    get_latent_mean_std,
+)
 
 
 class LitContactDiff(L.LightningModule):
@@ -293,20 +53,17 @@ class LitContactDiff(L.LightningModule):
             p.requires_grad = False
 
         self.lr = lr
-        # self.diffusion_model: LatentDDPM = LatentDDPM(
+
         self.diffusion_model: LatentFlowMatching = LatentFlowMatching(
             hidden_dim=hidden_size,
             model_dim=model_dim,
             latent_dim=latent_dim,
             emb_size=embedding_size,
-            # timesteps=args.num_steps,
             heads=heads,
             conditioning_depth=conditioning_depth,
             noise_emb_dim=noise_emb_dim,
             device=torch.device("cuda"),
-            # loss_target=args.diffusion_target,
             protein_mixer_depth=protein_mixer_depth,
-            # mixer_depths=args.mixer_depths,
             mean=mean,
             std=std,
             latent_mean=latent_mean,
@@ -320,11 +77,11 @@ class LitContactDiff(L.LightningModule):
         self,
         binder: Features,
         target: Features,
-        z: Tensor,  # (B, M+N, latent_dim)
-        bind_H: Tensor,  # (B, M, hidden_dim)
-        target_H: Tensor,  # (B, N, hidden_dim)
+        z: Tensor,
+        bind_H: Tensor,
+        target_H: Tensor,
         step: int,
-        res_mask: Tensor = None,  # (B, M+N, 1) float/bool, 1 = valid)
+        res_mask: Tensor = None,
     ):
         return self.diffusion_model(
             binder, target, z, bind_H, target_H, step, res_mask=res_mask
@@ -337,58 +94,24 @@ class LitContactDiff(L.LightningModule):
         )
         return [optimizer], [scheduler]
 
-    # -------------------------------
-    # TRAINING STEP
-    # -------------------------------
-    # def training_step(self, batch, batch_idx):
-    #     binder, target = batch
-
-    #     binder_ca = binder.X[:, :, 1]
-    #     target_ca = target.X[:, :, 1]
-
-    #     # Pad coords and masks
-    #     binder_ca, target_ca = pad_coords(
-    #         binder_ca, target_ca, self.max_rows, self.max_cols
-    #     )
-
-    #     # Distances (Å)
-    #     x = torch.cdist(binder_ca, target_ca)
-
-    #     # Forward pass through VAE (always return reconstruction so we can compute metrics)
-    #     with torch.no_grad():
-    #         z, binder_H, target_H = self.vae.vae.get_latents(x, binder, target)
-
-    #     loss = self.diffusion_model(z, binder_H, target_H, self.global_step)
-
-    #     self.log("train/loss", loss, prog_bar=True, on_step=True)
-
-    #     return loss
     def training_step(self, batch, batch_idx):
         binder, target = batch
 
         binder_ca = binder.X[:, :, 1]
         target_ca = target.X[:, :, 1]
 
-        # Per-residue masks
-        bind_mask = binder.A[:, :, 1].clamp(max=1).bool()  # (B, M)
-        tgt_mask = target.A[:, :, 1].clamp(max=1).bool()  # (B, N)
+        bind_mask = binder.A[:, :, 1].clamp(max=1).bool()
+        tgt_mask = target.A[:, :, 1].clamp(max=1).bool()
 
-        # Pairwise mask (B, M, N)
-        pair_mask = bind_mask.unsqueeze(2) & tgt_mask.unsqueeze(1)
+        x = torch.cdist(binder_ca, target_ca)
 
-        # Distances (Å)
-        x = torch.cdist(binder_ca, target_ca)  # (B, M, N)
-
-        # Forward pass through VAE to get latents & protein features
         with torch.no_grad():
             z = self.vae.vae.get_latents(x, binder, target)
             binder_cond, target_cond = self.vae.vae.get_diff_conditioning(
                 binder, target
             )
 
-        # Residue mask for latents: concat binder & target masks
         res_mask = torch.cat([bind_mask, tgt_mask], dim=1).unsqueeze(-1).float()
-        # res_mask: (B, M+N, 1)
 
         loss = self.diffusion_model(
             binder,
@@ -396,9 +119,8 @@ class LitContactDiff(L.LightningModule):
             z,
             binder_cond,
             target_cond,
-            # self.global_step,
             res_mask=res_mask,
-            guidance_scale=5.0
+            guidance_scale=5.0,
         )
 
         self.log("train/loss", loss, prog_bar=True, on_step=True)
@@ -414,40 +136,32 @@ class LitContactDiff(L.LightningModule):
 
         B = binder_ca.size(0)
 
-        # Pad masks based on A
+        bind_mask = binder.A[:, :, 1].clamp(max=1).bool()
+        tgt_mask = target.A[:, :, 1].clamp(max=1).bool()
+        pair_mask = bind_mask.unsqueeze(2) & tgt_mask.unsqueeze(1)
 
-        bind_mask = binder.A[:, :, 1].clamp(max=1).bool()  # (B, M)
-        tgt_mask = target.A[:, :, 1].clamp(max=1).bool()  # (B, N)
-        pair_mask = bind_mask.unsqueeze(2) & tgt_mask.unsqueeze(1)  # (B, M, N)
+        x = torch.cdist(binder_ca, target_ca)
 
-        # Ground-truth distances (Å)
-        x = torch.cdist(binder_ca, target_ca)  # (B, M, N)
-
-        # Always ask VAE protein encoder to return latents
-        with torch.no_grad() as X, torch.inference_mode() as Y:
+        with torch.no_grad(), torch.inference_mode():
             z = self.vae.vae.get_latents(x, binder, target)
             binder_cond, target_cond = self.vae.vae.get_diff_conditioning(
                 binder, target
             )
 
-        # Residue mask for latents
         res_mask = torch.cat([bind_mask, tgt_mask], dim=1).unsqueeze(-1).float()
 
-        with torch.no_grad() as X, torch.inference_mode() as Y:
+        with torch.no_grad(), torch.inference_mode():
             val_loss = self.diffusion_model(
                 binder,
                 target,
                 z,
                 binder_cond,
                 target_cond,
-                # self.global_step,
                 res_mask=res_mask,
             )
         self.log("val/loss", val_loss, prog_bar=True, on_step=False, on_epoch=True)
 
-        # Save visualization for batch 0
-        # if batch_idx == 3:
-        with torch.no_grad() as X, torch.inference_mode() as Y:
+        with torch.no_grad(), torch.inference_mode():
             samples = self.diffusion_model.sample(
                 binder,
                 target,
@@ -458,14 +172,10 @@ class LitContactDiff(L.LightningModule):
                 guidance_scale=5.0,
             )
 
-            # Decode samples
-            x_recon_phys = self.vae.vae.decode(
-                samples, binder, target, upscale=True
-            )  # (B, M, N)
+            x_recon_phys = self.vae.vae.decode(samples, binder, target, upscale=True)
 
             x_recon_vae = self.vae.vae.decode(z, binder, target, upscale=True)
 
-        # Masked MSE over valid residue pairs only
         mse_gt = F.mse_loss(
             x_recon_phys[pair_mask],
             x[pair_mask],
@@ -475,31 +185,28 @@ class LitContactDiff(L.LightningModule):
             x[pair_mask],
         )
 
-        # Maksed MSE over contact (within 8A) pairs only
         within_8_mask = x < 8.0
         mse_gt_8A = F.mse_loss(
             x_recon_phys[pair_mask & within_8_mask],
             x[pair_mask & within_8_mask],
         )
 
-        # NDCG for top-k contacts
         top_k = 50
         ndcg_scores = []
         for i in range(B):
-            true_dists = x[i][pair_mask[i]]  # (num_valid_pairs,)
-            pred_dists = x_recon_phys[i][pair_mask[i]]  # (num_valid_pairs,)
+            true_dists = x[i][pair_mask[i]]
+            pred_dists = x_recon_phys[i][pair_mask[i]]
 
             if true_dists.size(0) < top_k:
                 continue
 
-            true_sorted, true_indices = torch.topk(
-                -true_dists, k=top_k
-            )  # smallest distances
+            true_sorted, true_indices = torch.topk(-true_dists, k=top_k)
             pred_sorted = pred_dists[true_indices]
 
-            # Compute DCG
-            gains = 1.0 / torch.log2(torch.arange(2, top_k + 2, device=true_dists.device).float())
-            ideal_gains = gains  # since true_sorted is perfectly ranked
+            gains = 1.0 / torch.log2(
+                torch.arange(2, top_k + 2, device=true_dists.device).float()
+            )
+            ideal_gains = gains
 
             dcg = (gains / (pred_sorted.argsort().argsort() + 2).float()).sum()
             idcg = ideal_gains.sum()
@@ -532,137 +239,11 @@ class LitContactDiff(L.LightningModule):
         generated = x_recon_phys.cpu()
 
         x_vis = x.clone()
-        if self.args.target_mode == "contact":
-            x_vis = self.vae.bin_distances(x_vis)
 
-        # Optional: zero out padded regions before plotting
         x_vis = x_vis.clone()
         gen_vis = generated.clone()
         x_vis[~pair_mask] = 0.0
         gen_vis[~pair_mask] = 0.0
-
-        Bv = x_vis.size(0)
-        # plt.figure(figsize=(15, 5))
-        # plt.suptitle(f"(VAE o Diffusion) Reconstructions @ step {self.global_step}")
-        # for i in range(Bv):
-        #     plt.subplot(2, Bv, i + 1)
-        #     plt.imshow(x_vis[i].float().cpu().numpy())
-        #     plt.title(f"Original {i}")
-        #     plt.axis("off")
-
-        #     min_value = 0
-        #     max_value = torch.max(gen_vis[i]).item()
-
-        #     colorbar_ticks = [min_value, max_value / 2, max_value]
-        #     cbar = plt.colorbar(ticks=colorbar_ticks)
-        #     cbar.ax.set_yticklabels([f"{tick:.1f}" for tick in colorbar_ticks])
-
-        #     plt.subplot(2, Bv, Bv + i + 1)
-        #     plt.imshow(gen_vis[i].float().cpu().numpy())
-        #     plt.title(f"Recon {i}")
-        #     plt.axis("off")
-        #     cbar = plt.colorbar(ticks=colorbar_ticks)
-        #     cbar.ax.set_yticklabels([f"{tick:.1f}" for tick in colorbar_ticks])
-
-        # Global min/max from ground-truth distances (masked)
-        # fig = plt.figure(figsize=(15, 5))
-        # plt.suptitle(f"(VAE ∘ Diffusion) Reconstructions @ step {self.global_step}")
-
-        # pred_coords = coords_from_distances(binder, target, generated)  # (B, M+N, 3)
-        # pred_coords = align_by_receptor(binder, target, pred_coords)
-
-        # pred_binder_coords = pred_coords[:, : binder_ca.size(1), :]  # (B, M, 3)
-        # pred_binder_coords = pred_coords.view(B, -1, 4, 3)[:, :, 1, :]
-        # pred_binder_coords = pred_binder_coords[:, : binder_ca.size(1), :].view(
-        #     B, -1, 3
-        # )
-
-        # pred_target_coords = pred_coords[:, binder_ca.size(1) :, :]  # (B, N, 3)
-        # for i in range(Bv):
-        #     binder_seq = idx_to_seq(binder.Si[i].view(1, -1))
-        #     target_seq = idx_to_seq(target.Si[i].view(1, -1))
-
-        #     # save_structures_ca(
-        #     #     binder_seq,
-        #     #     target_seq,
-        #     #     pred_binder_coords[i],
-        #     #     pred_target_coords[i],
-        #     #     f"{self.args.save_path}/{self.args.exp_name}/diff_outputs/step_{self.global_step}_batch1.pdb",
-        #     #     binder.pdbs[i],
-        #     #     "",
-        #     # )
-
-            # binder_mask = binder.A[i, :, 1] > 0
-            # target_mask = target.A[i, :, 1] > 0
-            # # binder_mask = binder.A[i].view(-1) > 0
-            # # target_mask = target.A[i].view(-1) > 0
-
-        #     lrmsd, irmsd, crmsd, dockq = self.meter.update_rmsd(
-        #         pred_binder_coords[i][binder_mask.cpu()].view(-1, 3).cpu(),
-        #         # target.X[i][:, 1, :][target_mask].view(-1, 3).cpu(),
-        #         # binder.X[i][:, 1, :][binder_mask].view(-1, 3).cpu(),
-        #         # target.X[i][:, 1, :][target_mask].view(-1, 3).cpu(),
-        #         target.X[i][:, 1, :].view(-1, 3)[target_mask].cpu(),
-        #         binder.X[i][:, 1, :].view(-1, 3)[binder_mask].cpu(),
-        #         target.X[i][:, 1, :].view(-1, 3)[target_mask].cpu(),
-        #     )
-
-        #     summary_stats = self.meter.get_summary_stats(reduction_rmsd="std")
-        #     dockq_mean = summary_stats["including_failed"]["dockq_mean"]
-        #     dockq_median = summary_stats["including_failed"]["dockq_median"]
-        #     dockq_std = summary_stats["including_failed"]["dockq_std"]
-
-        #     print(
-        #         f"lrmsd: {lrmsd:.3f}, irmsd: {irmsd:.3f}, crmsd: {crmsd:.3f}, dockq: {dockq:.3f}"
-        #     )
-        #     print(f"RMSD stats after step {self.global_step}, batch {i}:")
-        #     print(
-        #         f"{dockq_mean:.3f} +/- {dockq_std:.3f} (mean +/- std); median: {dockq_median:.3f}"
-        #     )
-        #     print("-----------------------------------------------------")
-        #     # print(f"RMSD stats after step {self.global_step}, batch {i}:")
-        #     # pprint(summary_stats)
-
-        # im = None
-        # for i in range(Bv):
-        #     gt_vals = x[i][pair_mask[i]]
-
-        #     vmin = gt_vals.min().item()
-        #     vmax = gt_vals.max().item()
-
-        #     # Ground-truth distances
-        #     ax = plt.subplot(3, Bv, i + 1)
-        #     im = ax.imshow(
-        #         x_vis[i].float().cpu().numpy(),
-        #         vmin=vmin,
-        #         vmax=vmax,
-        #     )
-        #     ax.set_title(f"Original {i}")
-        #     ax.axis("off")
-        #     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
-        #     # Diffusion + VAE reconstructions
-        #     ax = plt.subplot(3, Bv, Bv + i + 1)
-        #     ax.imshow(
-        #         gen_vis[i].float().cpu().numpy(),
-        #         vmin=vmin,
-        #         vmax=vmax,
-        #     )
-        #     ax.set_title(f"Recon {i}")
-        #     ax.axis("off")
-        #     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
-        #     # VAE reconstructions with ground-truth latents
-        #     ax = plt.subplot(3, Bv, 2 * Bv + i + 1)
-        #     ax.imshow(
-        #         x_recon_vae[i].float().cpu().numpy(),
-        #         vmin=vmin,
-        #         vmax=vmax,
-        #     )
-
-        #     ax.set_title(f"VAE Recon {i}")
-        #     ax.axis("off")
-        #     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
         plt.savefig(
             f"{self.args.save_path}/{self.args.exp_name}/diff_outputs/step_{self.global_step}.png"
@@ -684,20 +265,15 @@ class LitContactDiff(L.LightningModule):
 
         B = binder_ca.size(0)
 
-        # Pad masks based on A
+        bind_mask = binder.A[:, :, 1].clamp(max=1).bool()
+        tgt_mask = target.A[:, :, 1].clamp(max=1).bool()
+        pair_mask = bind_mask.unsqueeze(2) & tgt_mask.unsqueeze(1)
 
-        bind_mask = binder.A[:, :, 1].clamp(max=1).bool()  # (B, M)
-        tgt_mask = target.A[:, :, 1].clamp(max=1).bool()  # (B, N)
-        pair_mask = bind_mask.unsqueeze(2) & tgt_mask.unsqueeze(1)  # (B, M, N)
+        x = torch.cdist(binder_ca, target_ca)
 
-        # Ground-truth distances (Å)
-        x = torch.cdist(binder_ca, target_ca)  # (B, M, N)
-
-        # Always ask VAE protein encoder to return latents
         z = self.vae.vae.get_latents(x, binder, target)
         binder_cond, target_cond = self.vae.vae.get_diff_conditioning(binder, target)
 
-        # Residue mask for latents
         res_mask = torch.cat([bind_mask, tgt_mask], dim=1).unsqueeze(-1).float()
 
         val_loss = self.diffusion_model(
@@ -706,12 +282,10 @@ class LitContactDiff(L.LightningModule):
             z,
             binder_cond,
             target_cond,
-            # self.global_step,
             res_mask=res_mask,
         )
         self.log("val/loss", val_loss, prog_bar=True, on_step=False, on_epoch=True)
 
-        # Save visualization for batch 0
         if batch_idx == 3:
             samples = self.diffusion_model.sample(
                 binder,
@@ -723,14 +297,10 @@ class LitContactDiff(L.LightningModule):
                 guidance_scale=5.0,
             )
 
-            # Decode samples
-            x_recon_phys = self.vae.vae.decode(
-                samples, binder, target, upscale=True
-            )  # (B, M, N)
+            x_recon_phys = self.vae.vae.decode(samples, binder, target, upscale=True)
 
             x_recon_vae = self.vae.vae.decode(z, binder, target, upscale=True)
 
-            # Masked MSE over valid residue pairs only
             mse_gt = F.mse_loss(
                 x_recon_phys[pair_mask],
                 x[pair_mask],
@@ -756,40 +326,15 @@ class LitContactDiff(L.LightningModule):
             generated = x_recon_phys.cpu()
 
             x_vis = x.clone()
-            if self.args.target_mode == "contact":
-                x_vis = self.vae.bin_distances(x_vis)
 
-            # Optional: zero out padded regions before plotting
             x_vis = x_vis.clone()
             gen_vis = generated.clone()
             x_vis[~pair_mask] = 0.0
             gen_vis[~pair_mask] = 0.0
 
             Bv = x_vis.size(0)
-            # plt.figure(figsize=(15, 5))
-            # plt.suptitle(f"(VAE o Diffusion) Reconstructions @ step {self.global_step}")
-            # for i in range(Bv):
-            #     plt.subplot(2, Bv, i + 1)
-            #     plt.imshow(x_vis[i].float().cpu().numpy())
-            #     plt.title(f"Original {i}")
-            #     plt.axis("off")
 
-            #     min_value = 0
-            #     max_value = torch.max(gen_vis[i]).item()
-
-            #     colorbar_ticks = [min_value, max_value / 2, max_value]
-            #     cbar = plt.colorbar(ticks=colorbar_ticks)
-            #     cbar.ax.set_yticklabels([f"{tick:.1f}" for tick in colorbar_ticks])
-
-            #     plt.subplot(2, Bv, Bv + i + 1)
-            #     plt.imshow(gen_vis[i].float().cpu().numpy())
-            #     plt.title(f"Recon {i}")
-            #     plt.axis("off")
-            #     cbar = plt.colorbar(ticks=colorbar_ticks)
-            #     cbar.ax.set_yticklabels([f"{tick:.1f}" for tick in colorbar_ticks])
-
-            # Global min/max from ground-truth distances (masked)
-            fig = plt.figure(figsize=(15, 5))
+            plt.figure(figsize=(15, 5))
             plt.suptitle(f"(VAE ∘ Diffusion) Reconstructions @ step {self.global_step}")
 
             im = None
@@ -799,7 +344,6 @@ class LitContactDiff(L.LightningModule):
                 vmin = gt_vals.min().item()
                 vmax = gt_vals.max().item()
 
-                # Ground-truth distances
                 ax = plt.subplot(3, Bv, i + 1)
                 im = ax.imshow(
                     x_vis[i].float().cpu().numpy(),
@@ -810,7 +354,6 @@ class LitContactDiff(L.LightningModule):
                 ax.axis("off")
                 plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-                # Diffusion + VAE reconstructions
                 ax = plt.subplot(3, Bv, Bv + i + 1)
                 ax.imshow(
                     gen_vis[i].float().cpu().numpy(),
@@ -821,7 +364,6 @@ class LitContactDiff(L.LightningModule):
                 ax.axis("off")
                 plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-                # VAE reconstructions with ground-truth latents
                 ax = plt.subplot(3, Bv, 2 * Bv + i + 1)
                 ax.imshow(
                     x_recon_vae[i].float().cpu().numpy(),
@@ -840,20 +382,18 @@ class LitContactDiff(L.LightningModule):
 
 
 def main(args):
-    dm = PPIDataModule(args)
+    dm = PPIDataModule(args, mode="latent")
 
-    # Compute dataset statistics
-    # mean, std = get_mean_std_distance(
-    #     dm.train_dataloader(),
-    #     which_dists=args.which_dists,
-    #     use_logscale=args.use_logscale,
-    # )
     mean, std = 34.9249697902463, 17.601150743644386
     vae = LitContactVAE.load_from_checkpoint(args.ckpt, args=args, mean=mean, std=std)
 
     dm.setup()
-    latent_mean, latent_std = get_latent_mean_std(dm.train_dataloader(), vae)
-    # latent_mean, latent_std = torch.load("latent_mean_std.pt").values()
+    latent_mean, latent_std = get_latent_mean_std(
+        dm.train_dataloader(),
+        vae,
+        cache_path="latent_mean_std_all_esm2.pt",
+        recompute=True,
+    )
 
     model = LitContactDiff(
         args,
@@ -899,7 +439,7 @@ def main(args):
         gradient_clip_val=10.0,
         check_val_every_n_epoch=1,
         log_every_n_steps=10,
-        precision="bf16-mixed",  # AMP
+        precision="bf16-mixed",
     )
 
     if args.tune_lr:
@@ -932,7 +472,7 @@ def main(args):
             noise_emb_dim=args.noise_emb_dim,
             protein_mixer_depth=args.protein_mixer_depth,
         )
-        # trainer.validate(model, datamodule=dm)
+
         dm.setup(stage="test")
         trainer.test(model, dataloaders=dm.test_dataloader())
         return
@@ -978,7 +518,6 @@ if __name__ == "__main__":
         "--ckpt", type=str, default=None, help="Path to model checkpoint"
     )
 
-    # Training parameters
     parser.add_argument(
         "--hidden_size", type=int, default=128, help="Latent diffusion dimension"
     )
@@ -1018,7 +557,6 @@ if __name__ == "__main__":
         help="Whether to use LR finder for VAE training",
     )
 
-    # VAE parameters
     parser.add_argument(
         "--vae_lr", type=float, default=1e-5, help="Learning rate for VAE"
     )
@@ -1041,7 +579,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--target_mode",
         type=str,
-        choices=["distances", "contact"],
+        choices=["distances"],
         default="distances",
         help="Target mode for VAE",
     )
@@ -1063,7 +601,6 @@ if __name__ == "__main__":
         help="Whether to run validation only",
     )
 
-    # Diffusion model parameters
     parser.add_argument(
         "--diffusion_lr",
         type=float,

@@ -1,9 +1,10 @@
-from .ddpm import *
-from .frame import *
-from .energy import *
-from .ema import *
-# from .graph import *
-# from .mpnn import *
-from .flash_ipa import *
-# from .egnn import *
-# from .erwin import *
+__all__ = ["AllAtomEnergyModel"]
+
+
+def __getattr__(name):
+    if name != "AllAtomEnergyModel":
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from .energy import AllAtomEnergyModel
+
+    globals()[name] = AllAtomEnergyModel
+    return AllAtomEnergyModel

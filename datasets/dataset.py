@@ -1,38 +1,37 @@
 from __future__ import annotations
+
 import pickle
 import random
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Callable
 from functools import partial
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 from torch.utils.data import (
-    Dataset,
-    DataLoader,
-    Sampler,
     BatchSampler,
+    DataLoader,
+    Dataset,
     RandomSampler,
+    Sampler,
     SequentialSampler,
     Subset,
 )
 from tqdm import tqdm
 
 from utils import (
+    ALPHABET,
+    ATOM_TYPES,
+    RES_ATOM14,
     Features,
     compute_dihedrals,
-    ALPHABET,
-    RES_ATOM14,
-    ATOM_TYPES,
     compute_spline_curvature,
     compute_spline_torsion,
+    get_resolution_indices,
     parametrize_backbone_spline,
 )
+
 from .loader import featurize
-import pdb as debugger
 
 
-# -----------------------------
-# Core Dataset
-# -----------------------------
 class ProteinDockingDataset(Dataset):
     """
     A PyTorch Dataset for rigid protein-protein docking pairs.
@@ -52,10 +51,10 @@ class ProteinDockingDataset(Dataset):
         self,
         data_path: str,
         patch_size: int,
-        patch_strategy: str = "dist_com",  # kept for compatibility; not used here
+        patch_strategy: str = "dist_com",
         resolution: str = "all_atom",
-        limit: Optional[int] = None,  # optional: load only first N for debugging
-        strict: bool = True,  # if True, raise on unknown resolution
+        limit: Optional[int] = None,
+        strict: bool = True,
     ):
         super().__init__()
         self.data_path = data_path
@@ -89,19 +88,16 @@ class ProteinDockingDataset(Dataset):
             if limit is not None and limit > 0 and idx >= limit:
                 break
 
-            # shape checks
             if len(aseq) != len(acoords) or len(bseq) != len(bcoords):
                 continue
 
             entry: Dict[str, Any] = {"pdb": pdb}
 
-            # binder (B) first, then target (A), to match your original code
             entry["binder_seq"] = bseq
             entry["binder_coords"] = torch.as_tensor(bcoords, dtype=torch.float32)[
                 :, :sel
             ]
 
-            # Skip if any residue has an atom triplet of zeros (any missing atom blocks)
             if self._has_any_zero_atom(entry["binder_coords"]):
                 print(f"Skipping {pdb}: zero coordinates in binder.")
                 continue
@@ -120,18 +116,16 @@ class ProteinDockingDataset(Dataset):
                 :, :sel
             ]
 
-            # center by mean of *target* coords (flattened across residues and atoms)
             target_com = (
                 entry["target_coords"]
                 .reshape(-1, 3)
                 .mean(dim=0, keepdim=True)[:, None, ...]
             )
-            # broadcast to [L, sel, 3]
+
             entry["target_coords"] = entry["target_coords"] - target_com
             entry["binder_coords"] = entry["binder_coords"] - target_com
 
             if self._has_any_zero_atom(entry["target_coords"]):
-                # print(f"Skipping {pdb}: zero coordinates in target.")
                 continue
 
             entry["target_dihedrals"] = compute_dihedrals(torch.as_tensor(acoords))
@@ -173,7 +167,6 @@ class ProteinDockingDataset(Dataset):
                 torch.tensor(torsion_tgt).float().view(N, sel, 1)
             )
 
-            # Mirror your make_site convenience (no slicing beyond sel; already applied)
             self.make_site(entry, "target", resolution=resolution)
             self.make_site(entry, "binder", resolution=resolution)
 
@@ -185,19 +178,14 @@ class ProteinDockingDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         return self._data[idx]
 
-    # ----- helpers -----
     @staticmethod
     def _resolution_to_sel(resolution: str, strict: bool = True) -> Tuple[int, int]:
-        if resolution == "all_atom":
+        try:
+            return get_resolution_indices(resolution)
+        except ValueError:
+            if strict:
+                raise
             return 14, 1
-        elif resolution == "backbone":
-            return 4, 1
-        elif resolution == "CA":
-            return 1, 0
-        if strict:
-            raise ValueError(f"Unknown resolution: {resolution}")
-        # default
-        return 14, 1
 
     @staticmethod
     def _has_any_zero_atom(coords: torch.Tensor) -> bool:
@@ -211,11 +199,11 @@ class ProteinDockingDataset(Dataset):
     def make_site(
         entry: Dict[str, Any], field: str, resolution: str = "all_atom"
     ) -> None:
-        # fields already in correct shapes; this mirrors your function
+
         if resolution not in {"all_atom", "backbone", "CA"}:
             raise ValueError(f"Unknown resolution: {resolution}")
         entry[f"{field}_full"] = entry[f"{field}_seq"]
-        # (coords/atypes already sliced to sel earlier)
+
         entry[f"{field}_coords"] = entry[f"{field}_coords"]
         entry[f"{field}_atypes"] = entry[f"{field}_atypes"]
         entry[f"{field}_dihedrals"] = entry[f"{field}_dihedrals"]
@@ -250,12 +238,9 @@ class ProteinDockingDataset(Dataset):
         return torch.sqrt(m2 / (n - 1)).item()
 
 
-# -----------------------------
-# Collate function (mirrors make_local_batch)
-# -----------------------------
 def make_protein_collate_fn(
     embedding: Optional[Dict[str, torch.Tensor]],
-    args,  # expects args.embedding_size, args.patch_size, args.resolution
+    args,
     binder: str = "binder",
     target: str = "target",
     device: Optional[torch.device] = None,
@@ -280,10 +265,8 @@ def make_protein_collate_fn(
         patch_size = getattr(args, "patch_size", 50)
 
     def _collate(batch: List[Dict[str, Any]]):
-        pdbs = [b["pdb"] for b in batch]  # per-batch IDs
+        pdbs = [b["pdb"] for b in batch]
 
-        # featurize returns: X, S, A, V, D, O  (we won't use D downstream, to mirror your tuple)
-        # keep computations on CPU here; move later if device is provided.
         bind_X, bind_S, bind_A, bind_V, bind_O, bind_T, bind_Si, bind_C = featurize(
             batch,
             binder,
@@ -299,7 +282,6 @@ def make_protein_collate_fn(
             resolution=resolution,
         )
 
-        # Overwrite *S* as in your original code
         if embedding is not None:
             bind_S = torch.zeros(
                 bind_S.size(0), bind_S.size(1), args.embedding_size, dtype=torch.float32
@@ -321,10 +303,9 @@ def make_protein_collate_fn(
         else:
             bind_S_ESM2 = None
             tgt_S_ESM2 = None
-        
+
         missing = []
 
-        # Fill S and O using sequence indices or embedding, matching your loop
         for i, b in enumerate(batch):
             L_tgt = len(b[f"{target}_full"])
             L_bind = len(b[f"{binder}_full"])
@@ -336,8 +317,6 @@ def make_protein_collate_fn(
                 [ALPHABET.index(a) for a in b[f"{binder}_full"]], dtype=torch.long
             )
             if embedding is not None:
-                # embedding must support indexing by residue char; e.g. embedding['A'] -> [E]
-                # If you had embedding over *strings*, ensure it's a dict mapping char->vector.
                 try:
                     tgt_S[i, :L_tgt] = embedding[b[f"{target}_full"]]
                 except:
@@ -362,7 +341,7 @@ def make_protein_collate_fn(
             bind_O[i, :L_bind] = torch.tensor(
                 [ALPHABET.index(a) for a in b[f"{binder}_full"]], dtype=torch.long
             )
-        
+
         with open("missing.txt", "w+") as file:
             for miss in missing:
                 file.writelines(miss + "\n")
@@ -377,9 +356,7 @@ def make_protein_collate_fn(
             bind_C,
             bind_Si,
             pdbs,
-        ), Features(
-            tgt_X, tgt_S, tgt_A, tgt_V, tgt_O, tgt_T, tgt_C, tgt_Si, pdbs
-        )
+        ), Features(tgt_X, tgt_S, tgt_A, tgt_V, tgt_O, tgt_T, tgt_C, tgt_Si, pdbs)
 
     return _collate
 
@@ -400,16 +377,12 @@ class RepeatSingleIndexBatchSampler(BatchSampler):
             if self.shuffle:
                 idx = random.randint(0, len(self.sampler) - 1)
 
-            # Form a batch of clones (same index repeated B times)
             yield [idx] * self.batch_size
 
     def __len__(self):
         return len(self.sampler)
 
 
-# -----------------------------
-# Sampler to pad last batch to full size (optional, mirrors your inf iterator behavior)
-# -----------------------------
 class PadToFullBatchBatchSampler(BatchSampler):
     """
     Wraps another sampler and ensures every yielded batch has exactly batch_size elements.
@@ -427,9 +400,7 @@ class PadToFullBatchBatchSampler(BatchSampler):
         self._sampler = sampler
         self._batch_size = batch_size
         self._drop_last = drop_last
-        self._dataset_len = (
-            dataset_len  # if None, we'll infer from sampler when possible
-        )
+        self._dataset_len = dataset_len
 
     def __iter__(self):
         batch = []
@@ -443,11 +414,9 @@ class PadToFullBatchBatchSampler(BatchSampler):
                 batch = []
 
         if batch and not self._drop_last:
-            # pad to full batch size with random choices
             need = self._batch_size - len(batch)
             population = all_indices if n > 0 else list(range(self._dataset_len or 0))
             if not population:
-                # degenerate case: empty dataset or sampler -> just yield the partial batch
                 yield batch
             else:
                 pad = random.choices(population, k=need)
@@ -455,8 +424,7 @@ class PadToFullBatchBatchSampler(BatchSampler):
                 yield batch
 
     def __len__(self) -> int:
-        # Number of full batches (ceil)
-        # We cannot easily know len(sampler) without materializing; do that like __iter__ does.
+
         all_indices = list(self._sampler)
         n = len(all_indices)
         if self._drop_last:
@@ -492,11 +460,13 @@ def get_cutoff_train_val_test_keys():
 
     return None, None, test_keys
 
+
 def get_cutoff_full_train_val_test_keys():
     with open("data/cutoff_full/test.txt") as f:
         test_keys = set([x for x in f.read().splitlines()])
 
     return None, None, test_keys
+
 
 def get_sabdab_full_train_val_test_keys():
     with open("data/sabdab/test.txt") as f:
@@ -504,12 +474,12 @@ def get_sabdab_full_train_val_test_keys():
 
     return None, None, test_keys
 
+
 def build_dataset(args):
     """
     Load full dataset once, then use Subset wrappers for train/val/test.
     """
 
-    # Load dataset once
     full_ds = ProteinDockingDataset(
         data_path=args.train_path,
         patch_size=args.patch_size,
@@ -518,11 +488,9 @@ def build_dataset(args):
         limit=args.limit,
     )
 
-    # Determine splits
     if "DIPS" in args.train_path:
         train_keys, val_keys, test_keys = get_dips_train_val_test_keys()
 
-        # Map pdb → list of indices that match
         pdb_to_indices = {}
         for idx, entry in enumerate(full_ds._data):
             pdb = entry["pdb"]
@@ -538,12 +506,8 @@ def build_dataset(args):
         val_idx = collect_indices(val_keys)
         test_idx = collect_indices(test_keys)
     elif "db55" in args.train_path:
-        # all_idx = list(range(len(full_ds)))
-        # train_idx = None
-        # val_idx = None
-        # test_idx = all_idx
         train_keys, val_keys, test_keys = get_db5_train_val_test_keys()
-        # Map pdb → list of indices that match
+
         pdb_to_indices = {}
         for idx, entry in enumerate(full_ds._data):
             pdb = entry["pdb"].split("_")[0]
@@ -563,7 +527,6 @@ def build_dataset(args):
         train_keys, val_keys, test_keys = get_cutoff_full_train_val_test_keys()
         pdb_to_indices = {}
         for idx, entry in enumerate(full_ds._data):
-            # pdb = entry["pdb"].split("_")[0]
             pdb_to_indices.setdefault(entry["pdb"], []).append(idx)
 
         def collect_indices(key_set):
@@ -580,7 +543,6 @@ def build_dataset(args):
         train_keys, val_keys, test_keys = get_sabdab_full_train_val_test_keys()
         pdb_to_indices = {}
         for idx, entry in enumerate(full_ds._data):
-            # pdb = entry["pdb"].split("_")[0]
             pdb_to_indices.setdefault(entry["pdb"], []).append(idx)
 
         def collect_indices(key_set):
@@ -597,7 +559,6 @@ def build_dataset(args):
         train_keys, val_keys, test_keys = get_cutoff_train_val_test_keys()
         pdb_to_indices = {}
         for idx, entry in enumerate(full_ds._data):
-            # pdb = entry["pdb"].split("_")[0]
             pdb_to_indices.setdefault(entry["pdb"], []).append(idx)
 
         def collect_indices(key_set):
@@ -618,7 +579,6 @@ def build_dataset(args):
         val_keys = dips_val_keys | db5_val_keys
         test_keys = dips_test_keys | db5_test_keys
 
-        # Map pdb → list of indices that match
         pdb_to_indices = {}
         for idx, entry in enumerate(full_ds._data):
             pdb = entry["pdb"]
@@ -638,29 +598,17 @@ def build_dataset(args):
         test_idx = collect_indices(test_keys)
         train_idx = collect_indices(train_keys)
     else:
-        # Non-DIPS: simple random split
         all_idx = list(range(len(full_ds)))
         random.shuffle(all_idx)
         split = int(0.9 * len(all_idx))
         train_idx, val_idx = all_idx[:split], all_idx[split:]
         test_idx = []
 
-    # if "db55" in args.train_path:
-    #     train = None
-    #     val = None
-    #     sample_val = None
-    #     test = Subset(full_ds, test_idx)
-    #     pass
-    # else:
-    # Subset objects (no re-loading)
     train = Subset(full_ds, train_idx)
     val = Subset(full_ds, val_idx)
-    sample_val = Subset(
-        full_ds, test_idx[: args.num_val_sample]
-    )  # small val for quick eval
+    sample_val = Subset(full_ds, test_idx[: args.num_val_sample])
     test = Subset(full_ds, test_idx)
 
-    # Optional: include skempi by extending train
     if getattr(args, "include_skempi", False):
         skempi_ds = ProteinDockingDataset(
             data_path=args.test_path,
@@ -669,7 +617,7 @@ def build_dataset(args):
             resolution=args.resolution,
             limit=args.limit,
         )
-        # Append skempi entries to the main dataset and refer to them
+
         base_len = len(full_ds)
         full_ds._data.extend(skempi_ds._data)
         train.indices.extend(range(base_len, base_len + len(skempi_ds)))

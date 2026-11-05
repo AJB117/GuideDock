@@ -1,27 +1,23 @@
-import math
-import pdb
 import torch
 import torch.nn as nn
 from torch import Tensor
-from torch.nn import TransformerEncoder, TransformerEncoderLayer, MultiheadAttention
-from utils import *
+from torch.nn import TransformerEncoder, TransformerEncoderLayer
 
-# from .graph import build_cross_graph_batch, build_rigid_graph_batch
-# from .mpnn import MPNNEncoder
+from utils import ALPHABET, Features
+
+from .common import FiLM, SinusoidalDistanceEmbedding
 from .encoders import (
-    SAEncoder,
     BidirectionalLSTMEncoder,
-    IPAEncoder,
-    FAFormerEncoder,
-    PairResidueEncoder,
-    # EGNNEncoder,
-    EquiformerEncoder,
-    FlashIPAEncoder,
     CrossAttentionEncoder,
     DiTEncoder,
+    EquiformerEncoder,
+    FAFormerEncoder,
+    FlashIPAEncoder,
+    IPAEncoder,
+    PairResidueEncoder,
+    SAEncoder,
 )
-from .modules import GaussianSmearing, FiLM, AdditiveGate, FourierFeats
-from .latent_modules import CustomCrossAttentionTransformer, SinusoidalDistanceEmbedding
+from .latent_modules import CustomCrossAttentionTransformer
 
 
 class FrameAveraging(nn.Module):
@@ -34,23 +30,19 @@ class FrameAveraging(nn.Module):
     def create_frame(self, X, mask):
         mask = mask.unsqueeze(-1)
         center = (X * mask).sum(dim=1) / mask.sum(dim=1)
-        X = X - center.unsqueeze(1) * mask  # [B,N,3]
-        C = torch.bmm(X.transpose(1, 2), X)  # [B,3,3] (Cov)
-        # _, V = torch.symeig(C.detach(), True)  # [B,3,3]
+        X = X - center.unsqueeze(1) * mask
+        C = torch.bmm(X.transpose(1, 2), X)
+
         _, V = torch.linalg.eigh(C.detach(), UPLO="U")
 
-        F_ops = self.ops.unsqueeze(1).unsqueeze(0) * V.unsqueeze(
-            1
-        )  # [1,8,1,3] x [B,1,3,3] -> [B,8,3,3]
-        h = torch.einsum(
-            "boij,bpj->bopi", F_ops.transpose(2, 3), X
-        )  # transpose is inverse [B,8,N,3]
+        F_ops = self.ops.unsqueeze(1).unsqueeze(0) * V.unsqueeze(1)
+        h = torch.einsum("boij,bpj->bopi", F_ops.transpose(2, 3), X)
         h = h.view(X.size(0) * 8, X.size(1), 3)
         return h, F_ops.detach(), center
 
     def invert_frame(self, X, mask, F_ops, center):
         X = torch.einsum("boij,bopj->bopi", F_ops, X)
-        X = X.mean(dim=1)  # frame averaging
+        X = X.mean(dim=1)
         X = X + center.unsqueeze(1)
         return X * mask.unsqueeze(-1)
 
@@ -105,7 +97,7 @@ class FAEncoder(FrameAveraging):
         h = self.silu(h)
         h = self.encoder(h.transpose(0, 1), src_key_padding_mask=~mask.bool())
         h = h.transpose(0, 1).view(B, 8, N + M, -1)
-        return h.mean(dim=1)  # frame averaging
+        return h.mean(dim=1)
 
 
 class SwiGLU(nn.Module):
@@ -186,18 +178,6 @@ class AllAtomEncoder(FrameAveraging):
             self.encoder_3 = FAFormerEncoder(
                 args, d_input=hidden_size // 2 + 2 * args.fourier_dim
             )
-        elif args.encoder == "gt":
-            self.encoder_1 = GraphTransformer(args.hidden_size, n_layers=args.depth)
-            self.encoder_2 = GraphTransformer(args.hidden_size, n_layers=args.depth)
-        elif args.encoder == "erwin":
-            self.encoder_1
-        elif args.encoder == "egnn":
-            self.encoder_1 = EGNNEncoder(args)
-        elif args.encoder == "mpnn":
-            # self.encoder_1 = MPNN(args)
-            # self.encoder_2 = MPNN(args)
-            # self.encoder_3 = CrossMPNN(args)
-            self.encoder = MPNNEncoder(args)
         elif args.encoder == "equiformer":
             self.encoder = EquiformerEncoder(args)
         elif args.encoder == "flash_ipa":
@@ -207,8 +187,7 @@ class AllAtomEncoder(FrameAveraging):
                 heads=args.heads,
                 dropout=args.dropout,
             )
-            # self.encoder_1 = FlashIPAEncoder(args)
-            # self.encoder_2 = FlashIPAEncoder(args)
+
         elif args.encoder == "cross":
             self.encoder = CrossAttentionEncoder(args)
             self.encoder_1 = CrossAttentionEncoder(args)
@@ -237,58 +216,12 @@ class AllAtomEncoder(FrameAveraging):
         )
         self.non_conservative = args.non_conservative
 
-        # self.edge_embedding = nn.Sequential(
-        #     GaussianSmearing(0.0, 180, args.num_edge_feats),
-        #     # GaussianSmearing(0.0, 180, args.num_edge_feats),
-        #     # nn.Linear(args.num_edge_feats, args.num_edge_feats),
-        #     nn.GELU(),
-        #     nn.Linear(args.num_edge_feats, 1, bias=False),
-        # )
-        # self.edge_embedding = ResidualEdgeEncoder(args.num_edge_feats, end=180)
         self.edge_embedding = nn.Sequential(
             SinusoidalDistanceEmbedding(dim=args.num_edge_feats),
             nn.Linear(args.num_edge_feats // 2, 1),
         )
 
         self.binder_target_encoding = nn.Embedding(2, hidden_size)
-
-        # self.cross_attention1 = MultiheadAttention(
-        #     embed_dim=hidden_size // 2
-        #     if args.encoder
-        #     not in (
-        #         "faformer",
-        #         "gt",
-        #         "mpnn",
-        #         "equiformer",
-        #         "flash_ipa",
-        #         "sa",
-        #         "cross",
-        #         "dit",
-        #     )
-        #     else hidden_size,
-        #     num_heads=args.heads,
-        #     dropout=args.dropout,
-        #     batch_first=True,
-        # )
-
-        # self.cross_attention = MultiheadAttention(
-        #     embed_dim=hidden_size // 2
-        #     if args.encoder
-        #     not in (
-        #         "faformer",
-        #         "gt",
-        #         "mpnn",
-        #         "equiformer",
-        #         "flash_ipa",
-        #         "sa",
-        #         "cross",
-        #         "dit",
-        #     )
-        #     else hidden_size,
-        #     num_heads=args.heads,
-        #     dropout=args.dropout,
-        #     batch_first=True,
-        # )
 
         self.cross_attention1 = CustomCrossAttentionTransformer(
             dim=hidden_size,
@@ -321,9 +254,6 @@ class AllAtomEncoder(FrameAveraging):
             else hidden_size
         )
 
-        # if self.non_conservative:
-        #     self.final_proj = DeepSets(final_proj_dim, hidden_size, hidden_size)
-        # else:
         self.final_proj1 = nn.Sequential(
             nn.Linear(final_proj_dim, hidden_size // 2),
             nn.SiLU(),
@@ -361,12 +291,6 @@ class AllAtomEncoder(FrameAveraging):
             num_layers=4,
         )
 
-        # self.spline_feature_encoder = nn.Sequential(
-        #     FourierFeats(args, 2),
-        #     nn.Linear(4 * args.fourier_dim, hidden_size // 2),
-        #     nn.Sigmoid()
-        # )
-
     def coarsen_A_types(self, A):
         """
         A: [B, N, hidden_size] tensor of atom embeddings to coarsen N -> n_supernodes
@@ -394,8 +318,6 @@ class AllAtomEncoder(FrameAveraging):
 
         bind_X, bind_S, bind_A, *_ = binder
         tgt_X, tgt_S, tgt_A, *_ = target
-        # bind_X, bind_Si, bind_A = binder.X, binder.Si, binder.A
-        # tgt_X, tgt_Si, tgt_A = target.X, target.Si, target.A
 
         bind_mask_residue = bind_A[:, :, bb].clamp(max=1).float()
         tgt_mask_residue = tgt_A[:, :, bb].clamp(max=1).float()
@@ -407,8 +329,6 @@ class AllAtomEncoder(FrameAveraging):
 
         bind_S = bind_S[:, :, None, :].expand(-1, -1, sel, -1).reshape(B, M * sel, -1)
         tgt_S = tgt_S[:, :, None, :].expand(-1, -1, sel, -1).reshape(B, N * sel, -1)
-        # bind_S = self.W_bind(bind_Si)[:, :, None, :].expand(-1, -1, sel, -1).reshape(B, M * sel, -1)
-        # tgt_S = self.W_tgt(tgt_Si)[:, :, None, :].expand(-1, -1, sel, -1).reshape(B, N * sel, -1)
 
         if not self.embedding:
             bind_S = bind_S.squeeze(-1)
@@ -436,14 +356,6 @@ class AllAtomEncoder(FrameAveraging):
         com_bind_normed = com_bind / (torch.norm(com_bind, dim=-1, keepdim=True) + 1e-6)
         com_tgt_normed = com_tgt / (torch.norm(com_tgt, dim=-1, keepdim=True) + 1e-6)
 
-        # spline_torsion_bind, spline_curvature_bind = binder.T.view(B, M*sel, 1), binder.C.view(B, M * sel, 1).log()
-        # spline_torsion_tgt, spline_curvature_tgt = target.T.view(B, N*sel, 1), target.C.view(B, N * sel, 1).log()
-
-        # spline_feats_bind = spline_torsion_bind / 100 + spline_curvature_bind / 100
-        # spline_feats_tgt = spline_torsion_tgt / 100 + spline_curvature_tgt / 100
-        # spline_feats_bind = self.spline_feature_encoder(torch.cat([spline_torsion_bind, spline_curvature_bind], dim=-1))
-        # spline_feats_tgt = self.spline_feature_encoder(torch.cat([spline_torsion_tgt, spline_curvature_tgt], dim=-1))
-
         bind_H = torch.cat(
             [bind_S_H, bind_A_H, time_steps_bind, com_bind_normed, com_bind_mag], dim=-1
         )
@@ -454,28 +366,6 @@ class AllAtomEncoder(FrameAveraging):
         bind_H = self.down_project_1(bind_H)
         tgt_H = self.down_project_2(tgt_H)
 
-        # bind_dist_emb, tgt_dist_emb = self.get_dists(
-        #     bind_X, tgt_X, binder_mask, tgt_mask
-        # )
-
-        # bind_H_dist, _ = self.cross_attention(
-        #     bind_H,
-        #     tgt_H,
-        #     tgt_H,
-        #     # bind_dist_emb
-        #     key_padding_mask=(~tgt_mask).float(),
-        #     attn_mask=bind_dist_emb,
-        #     need_weights=False,
-        # )
-        # tgt_H_dist, _ = self.cross_attention1(
-        #     tgt_H,
-        #     bind_H,
-        #     bind_H,
-        #     # tgt_dist_emb
-        #     key_padding_mask=(~binder_mask).float(),
-        #     attn_mask=tgt_dist_emb,
-        #     need_weights=False,
-        # )
         bind_dist_emb = self.get_internal_dists(binder, target)
         bind_H_dist = self.cross_attention(
             bind_H,
@@ -500,8 +390,6 @@ class AllAtomEncoder(FrameAveraging):
 
             all_H = self.encoder(all_X, all_H, all_mask, all_time_steps, dist_emb)
 
-            # bind_H = all_H[:, : M * sel, :] + bind_H
-            # tgt_H = all_H[:, M * sel :, :] + tgt_H
             bind_H = all_H[:, : M * sel, :]
             tgt_H = all_H[:, M * sel :, :]
 
@@ -512,7 +400,12 @@ class AllAtomEncoder(FrameAveraging):
             bind_H = cross_bind_H + bind_H
 
             cross_tgt_H = self.encoder_2(
-                tgt_H, bind_H, bind_H, time_steps_tgt, time_steps_bind, tgt_dist_emb
+                tgt_H,
+                bind_H,
+                bind_H,
+                time_steps_tgt,
+                time_steps_bind,
+                bind_dist_emb.transpose(1, 2),
             )
             tgt_H = cross_tgt_H + tgt_H
 
@@ -521,92 +414,36 @@ class AllAtomEncoder(FrameAveraging):
                 [bind_X.view(B, M, sel, 3), tgt_X.view(B, N, sel, 3)],
                 dim=1,
             )
-            bind_H_comb = bind_H.view(B, M, sel, -1).sum(dim=2)  # [B, M, D]
-            tgt_H_comb = tgt_H.view(B, N, sel, -1).sum(dim=2)  # [B, N, D]
-            # bind_H_comb = bind_H.view(B, M * sel, -1)
-            # tgt_H_comb = tgt_H.view(B, N * sel, -1)
+            bind_H_comb = bind_H.view(B, M, sel, -1).sum(dim=2)
+            tgt_H_comb = tgt_H.view(B, N, sel, -1).sum(dim=2)
 
             all_H_prev = torch.cat([bind_H_comb, tgt_H_comb], dim=1)
-            # all_mask = torch.cat([binder_mask, tgt_mask], dim=1)
+
             all_mask = torch.cat(
                 [bind_mask_residue.bool(), tgt_mask_residue.bool()], dim=1
             )
             all_time_steps = time_steps.view(B, 1, -1).repeat_interleave(
-                # (M + N) * sel, dim=1
                 (M + N),
                 dim=1,
             )
 
-            all_H = self.encoder(
-                all_X, all_H_prev, all_mask, sel, all_time_steps
-            )  # [B, (M+N)*sel, D]
+            all_H = self.encoder(all_X, all_H_prev, all_mask, sel, all_time_steps)
             all_H = self.layernorm(all_H + all_H_prev)
 
-            # bind_H = all_H[:, : M * sel, :] + bind_H
-            # tgt_H = all_H[:, M * sel :, :] + tgt_H
             all_H = self.transformer_encoder(
                 all_H.transpose(0, 1), src_key_padding_mask=~all_mask.bool()
             ).transpose(0, 1)
 
-            # bind_H = all_H[:, : M * sel, :] + bind_H_dist.view(B, M * sel, -1)
-            # tgt_H = all_H[:, M * sel:, :] + tgt_H_dist.view(B, N * sel, -1)
             bind_H = all_H[:, :M, :] + bind_H_dist.view(B, M, sel, -1).mean(dim=2)
             tgt_H = all_H[:, M:, :] + tgt_H_dist.view(B, N, sel, -1).mean(dim=2)
 
-            # bind_H = self.encoder_1(
-            #     bind_X.view(B, M, sel, 3),
-            #     bind_H,
-            #     binder_mask,
-            #     sel,
-            #     time_steps_bind,
-            # ) + bind_H_dist
-            # tgt_H = self.encoder_2(
-            #     tgt_X.view(B, N, sel, 3),
-            #     tgt_H,
-            #     tgt_mask,
-            #     sel,
-            #     time_steps_tgt,
-            # ) + tgt_H_dist
-
-        elif self.encoder_type == "mpnn":
-            bind_X_centered = bind_X_centered.view(B, M, sel, -1)
-            bind_A = bind_A.view(B, M, sel, -1)
-            bind_S = bind_S.view(B, M, sel, -1)
-
-            tgt_X_centered = tgt_X_centered.view(B, N, sel, -1)
-            tgt_A = tgt_A.view(B, N, sel, -1)
-            tgt_S = tgt_S.view(B, N, sel, -1)
-
-            bind_H, tgt_H = self.encoder(
-                bind_X_centered,
-                bind_H.view(B, M, sel, -1),
-                bind_A,
-                bind_S,
-                # bind_X, bind_H, bind_A, bind_S,
-                tgt_X_centered,
-                tgt_H.view(B, N, sel, -1),
-                tgt_A,
-                tgt_S,
-                # tgt_X, tgt_H, tgt_A, tgt_S,
-                20,
-                eps_tr * 3 + 40,
-                time_steps_bind[0][0],
-                bind_mask_residue.long(),
-                tgt_mask_residue.long(),
-            )
         elif self.encoder_type == "equiformer":
             all_H = torch.cat([bind_H, tgt_H], dim=1)
-            all_X = torch.cat([bind_X_centered, tgt_X_centered], dim=1)
+            all_X = torch.cat([bind_X, tgt_X], dim=1)
             all_mask = torch.cat([binder_mask, tgt_mask], dim=1)
 
             H = self.encoder(all_H, all_X, ~all_mask)
-        elif self.encoder_type == "gt":
-            bind_H = self.encoder_1(
-                bind_X.view(B, -1, 3), bind_H, time_steps, binder_mask
-            )
-            tgt_H = self.encoder_2(tgt_X.view(B, -1, 3), tgt_H, time_steps, tgt_mask)
         else:
-            #! separate encoders
             bind_H = self.encoder_1(bind_H, bind_X, ~binder_mask, 30)
             tgt_H = self.encoder_2(tgt_H, tgt_X, ~tgt_mask, 30)
 
@@ -621,67 +458,18 @@ class AllAtomEncoder(FrameAveraging):
             bind_H = self.proj_1(bind_H)
             tgt_H = self.proj_2(tgt_H)
 
-            #! 1 encoder, separate embeddings
-            # all_H = torch.cat([bind_H, tgt_H], dim=1)
-            # all_X = torch.cat([bind_X_centered, tgt_X_centered], dim=1)
-            # all_mask = torch.cat([binder_mask, tgt_mask], dim=1)
-            # if self.encoder_type == "egnn":
-            #     all_H = all_H.view(B, -1)
-            #     H = self.encoder_1(all_H, all_X, 130)
-            # else:
-            #     H = self.encoder_1(all_H, all_X, ~all_mask, 130)
-            # bind_H = H[:, :M * sel, :]
-            # tgt_H = H[:, M * sel :, :]
-
-        # if self.non_conservative:
-        #     h = self.cross_attention(bind_H, tgt_H, tgt_H)[0]
-        #     num_nonzero = binder_mask.sum() // 3
-        #     h = self.final_proj(h, num_nonzero)
-        #     return h.view(B, -1)
-
-        # h1 = self.final_proj1(h1)
-        # h1, _ = self.cross_attention(
-        #     bind_H,
-        #     tgt_H,
-        #     tgt_H,
-        #     key_padding_mask=(~tgt_mask).float(),
-        #     attn_mask=bind_dist_emb,
-        #     need_weights=False,
-        # )
-        # h1 = self.final_proj1(h1)
-        # h2, _ = self.cross_attention(
-        #     tgt_H,
-        #     bind_H,
-        #     bind_H,
-        #     key_padding_mask=(~binder_mask).float(),
-        #     attn_mask=tgt_dist_emb,
-        #     need_weights=False,
-        # )
-        # h2 = self.final_proj2(h2)
         h1, h2 = bind_H, tgt_H
 
         return h1.view(B, M, sel, -1), h2.view(B, N, sel, -1)
 
     def get_internal_dists(self, binder: Features, target: Features):
         B = binder.X.size(0)
-        # cplx = torch.cat([binder.X.view(B, -1, 3), target.X.view(B, -1, 3)], dim=1)
-        # cplx_internal_dist = torch.cdist(cplx, cplx)  # (B, M+N, M+N)
 
-        # binder_mask = binder.A.view(B, -1).clamp(max=1.0).bool()
-        # target_mask = target.A.view(B, -1).clamp(max=1.0).bool()
-        # cplx_mask = torch.cat([binder_mask, target_mask], dim=1)  # (B, M+N)
-        # pair_mask = cplx_mask.unsqueeze(2) & cplx_mask.unsqueeze(1)  # (B, M+N, M+N)
-
-        # cplx_dist_H = self.edge_embedding(cplx_internal_dist).squeeze(-1)
-        # dtype = cplx_dist_H.dtype
-        # cplx_dist_H = cplx_dist_H.masked_fill((~pair_mask).unsqueeze(1), torch.finfo(dtype).min)
-        dists = torch.cdist(
-            binder.X.view(B, -1, 3), target.X.view(B, -1, 3), p=2
-        )  # (B, M, N)
+        dists = torch.cdist(binder.X.view(B, -1, 3), target.X.view(B, -1, 3), p=2)
         binder_mask = binder.A.view(B, -1).clamp(max=1.0).bool()
         target_mask = target.A.view(B, -1).clamp(max=1.0).bool()
         pair_mask = binder_mask.unsqueeze(2) & target_mask.unsqueeze(1)
-        # cplx_attn_bias = self.edge_embedding(dists.unsqueeze(-1)).squeeze(-1)
+
         cplx_attn_bias = self.edge_embedding(dists.unsqueeze(-1))
         dtype = cplx_attn_bias.dtype
         cplx_attn_bias = cplx_attn_bias.masked_fill(
@@ -705,8 +493,6 @@ class AllAtomEncoder(FrameAveraging):
 
         bind_dist_emb = bind_dist_emb.masked_fill((~tgt_mask).unsqueeze(1), -1e9)
         tgt_dist_emb = tgt_dist_emb.masked_fill((~binder_mask).unsqueeze(1), -1e9)
-        # bind_dist_emb = bind_dist_emb.masked_fill((~tgt_mask).unsqueeze(1), 0)
-        # tgt_dist_emb = tgt_dist_emb.masked_fill((~binder_mask).unsqueeze(1), 0)
 
         bind_dist_emb = bind_dist_emb.repeat_interleave(self.heads, 0)
         tgt_dist_emb = tgt_dist_emb.repeat_interleave(self.heads, 0)

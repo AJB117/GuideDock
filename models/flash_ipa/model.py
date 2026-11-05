@@ -14,7 +14,8 @@ from .ipa import StructureModuleTransition, BackboneUpdate, EdgeTransition, Inva
 from .utils import ANG_TO_NM_SCALE, NM_TO_ANG_SCALE, check_config_ipa
 from .rigid import create_rigid
 from .linear import Linear
-from ..modules import FiLM, AdditiveGate
+from ..common import FiLM
+from ..modules import AdditiveGate
 from dataclasses import dataclass, field
 
 

@@ -6,9 +6,10 @@ Preprocessing for the SO(3) sampling and score computations, truncated infinite 
 cached to memory, therefore the precomputation is only run the first time the repository is run on a machine
 """
 
-import torch
 import os
+
 import numpy as np
+import torch
 from scipy.spatial.transform import Rotation
 
 MIN_EPS, MAX_EPS, N_EPS = 0.01, 2, 1000
@@ -17,13 +18,13 @@ X_N = 2000
 omegas = np.linspace(0, np.pi, X_N + 1)[1:]
 
 
-def _compose(r1, r2):  # R1 @ R2 but for Euler vecs
+def _compose(r1, r2):
     return Rotation.from_matrix(
         Rotation.from_rotvec(r1).as_matrix() @ Rotation.from_rotvec(r2).as_matrix()
     ).as_rotvec()
 
 
-def _expansion(omega, eps, L=2000):  # the summation term only
+def _expansion(omega, eps, L=2000):
     p = 0
     for l in range(L):
         p += (
@@ -35,18 +36,14 @@ def _expansion(omega, eps, L=2000):  # the summation term only
     return p
 
 
-def _density(
-    expansion, omega, marginal=True
-):  # if marginal, density over [0, pi], else over SO(3)
+def _density(expansion, omega, marginal=True):
     if marginal:
         return expansion * (1 - np.cos(omega)) / np.pi
     else:
-        return (
-            expansion / 8 / np.pi**2
-        )  # the constant factor doesn't affect any actual calculations though
+        return expansion / 8 / np.pi**2
 
 
-def _score(exp, omega, eps, L=2000):  # score of density over SO(3)
+def _score(exp, omega, eps, L=2000):
     dSigma = 0
     for l in range(L):
         hi = np.sin(omega * (l + 1 / 2))
